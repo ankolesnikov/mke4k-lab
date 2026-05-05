@@ -767,7 +767,7 @@ upload_mke3_images() {
     registry_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
 
     local reg_host="${registry_hostname}"
-    local bundle_url="${MKE3_BUNDLE_URL:-https://packages.mirantis.com/caas/ucp_images_${mke3_version}.tar.gz}"
+    local bundle_url="${MKE3_BUNDLE_URL:-${mke3_bundle_url:-https://packages.mirantis.com/caas/ucp_images_${mke3_version}.tar.gz}}"
 
     # Create 'mke3' project in Harbor (idempotent)
     ssh_node "${ssh_key}" "${bastion_ip}" "
@@ -913,7 +913,7 @@ upload_mke4k_bundle() {
     local registry_pass
     registry_pass="$(grep '^password=' "${creds_file}" | cut -d= -f2)"
 
-    local bundle_url="${MKE4K_BUNDLE_URL:-https://packages.mirantis.com/caas/mke_bundle_${mke4k_version}_amd64.tar.gz}"
+    local bundle_url="${MKE4K_BUNDLE_URL:-${mke4k_bundle_url:-https://packages.mirantis.com/caas/mke_bundle_${mke4k_version}_amd64.tar.gz}}"
 
     info "Downloading + uploading MKE4k bundle to registry (mode=${upload_mode}, dir=${bundle_base})..."
 
