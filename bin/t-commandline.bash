@@ -2888,7 +2888,7 @@ cmd_deploy_nfs() {
 
 kof_preflight() {
     local tool
-    for tool in helm yq kubectl; do
+    for tool in helm yq kubectl jq; do
         command -v "${tool}" >/dev/null 2>&1 \
             || die "KOF requires '${tool}' in PATH."
     done
@@ -3060,6 +3060,59 @@ kof_add_mke_datasource() {
     kubectl wait --for=condition=Established \
         crd/grafanadatasources.grafana.integreatly.org --timeout=5m || true
     kubectl apply -n kof -f "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml"
+    return 0
+}
+
+# Companion to dropping KOF's node-exporter (kof_reuse_mke_monitoring): MKE's
+# node-exporter ServiceMonitor does NOT add the `node` target label KOF's
+# dashboards key on (node-exporter-full's Host = label_values(node_uname_info, node)),
+# so MKE's node_* series arrive without it and the dashboard's host picker is empty.
+# Stamp `node` from the per-node downward-API env var OTEL_K8S_NODE_NAME onto every
+# node_* metric that lacks it, on the target-allocator DaemonSet collector that
+# scrapes node-exporter. Scoped to node_* + node==nil so KSM/kubelet and KOF's own
+# series (full mode) are never touched. `job` can't be used as the guard — the
+# prometheus receiver promotes it to a resource attribute, so it isn't a datapoint
+# attribute at transform time; the metric-name match is reliable instead.
+# The OpenTelemetryCollector is Flux-managed, so (like kof_prune_dashboards) this is
+# a post-install reconcile re-applied each deploy; the collector is rolled after.
+kof_apply_node_label_transform() {
+    local cr="kof-collectors-ta-daemon" ds="kof-collectors-ta-daemon-collector"
+    local stmt='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["node"] == nil'
+
+    kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
+        || { warn "Collector ${cr} not found — skipping node-label transform."; return 0; }
+
+    info "Adding node-label transform to ${cr} (reuse-MKE-monitoring node-exporter fix)..."
+
+    # Read the current metrics-pipeline processor list and insert transform/setnode
+    # just before "batch" (idempotent — no-op if already present), so we don't
+    # clobber whatever processors the chart shipped.
+    local cur_json new_json
+    cur_json="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+        | jq -c '.spec.config.service.pipelines.metrics.processors // []')"
+    if [[ -z "${cur_json}" || "${cur_json}" == "null" ]]; then
+        warn "Could not read ${cr} metrics pipeline — skipping node-label transform."
+        return 0
+    fi
+    new_json="$(jq -c '
+        if index("transform/setnode") then .
+        elif index("batch") then index("batch") as $b | .[0:$b] + ["transform/setnode"] + .[$b:]
+        else . + ["transform/setnode"] end' <<<"${cur_json}")"
+
+    local patch_file
+    patch_file="$(mktemp "${TMPDIR:-/tmp}/kof-setnode-XXXX.json")"
+    jq -n --arg s "${stmt}" --argjson procs "${new_json}" '
+        {spec:{config:{
+            processors:{"transform/setnode":{metric_statements:[{context:"datapoint",statements:[$s]}]}},
+            service:{pipelines:{metrics:{processors:$procs}}}
+        }}}' > "${patch_file}"
+    kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${patch_file}"
+    rm -f "${patch_file}"
+
+    # Roll the collector so the operator regenerates its config, then wait it out.
+    kubectl -n kof rollout restart "ds/${ds}" >/dev/null 2>&1 || true
+    kubectl -n kof rollout status "ds/${ds}" --timeout=180s || true
+    success "Node-label transform applied to ${cr}."
     return 0
 }
 
@@ -3255,6 +3308,13 @@ cmd_deploy_kof() {
         if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
             kof_add_mke_datasource
         fi
+    fi
+
+    # Reuse-MKE-monitoring: relabel MKE's node-exporter series with `node` so the
+    # node dashboards (whose Host picker keys on `node`) work after dropping KOF's
+    # own node-exporter. Runs regardless of Grafana (it fixes the data in VM).
+    if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
+        kof_apply_node_label_transform
     fi
 
     # Lean: prune the dashboards that have no backing data (tracing/FinOps removed,
