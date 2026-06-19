@@ -1,0 +1,44 @@
+# KOF deployment profile: FULL
+# ---------------------------------------------------------------------------
+# The complete KOF observability + FinOps platform, in single-cluster
+# self-monitoring (M2M) mode. This file is the editable "scope" overlay layered
+# on top of kof/global-values.yaml by `t deploy kof full` (helm -f). Only the
+# deploy-time substitutions (resolved StorageClass, k0rdent/KCM namespace
+# repointing, cluster identity labels) are injected separately by the deploy
+# script — everything about WHAT gets installed lives here.
+#
+# To trim the stack, copy this to a new profile or edit kof/profiles/lean.yaml.
+# Keys are nested under each umbrella component's `.values` exactly as the
+# `kof` umbrella chart expects.
+
+# Self-monitoring only: kof-regional / kof-child install regional/child cluster
+# templates (and pull in istio/external-dns/envoy service templates). Disabling
+# them also avoids their kcm-system pre-install hooks.
+kof-regional:
+  enabled: false
+kof-child:
+  enabled: false
+
+kof-storage:
+  enabled: true
+  values:
+    # VictoriaTraces — distributed tracing store. Kept in full mode.
+    victoria-traces-cluster:
+      enabled: true
+
+kof-collectors:
+  enabled: true
+  values:
+    # OpenCost — FinOps / cost reporting. Kept in full mode.
+    opencost:
+      enabled: true
+    kcm:
+      monitoring: true
+    opentelemetry-kube-stack:
+      # Cluster identity reported by the collectors.
+      clusterName: mothership
+      # KOF's bundled node-exporter defaults to hostNetwork: true and would bind
+      # the node's :9100, which MKE4k's built-in monitoring node-exporter already
+      # owns -> KOF pods stuck Pending ("no free ports"). Run it pod-networked.
+      prometheus-node-exporter:
+        hostNetwork: false

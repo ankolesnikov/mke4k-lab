@@ -126,11 +126,16 @@ load_config() {
 
     # KOF defaults
     kof_enabled="${kof_enabled:-false}"
+    kof_mode="${kof_mode:-full}"
+    kof_storage_ha="${kof_storage_ha:-true}"
     kof_version="${kof_version:-1.8.1}"
     kof_storage_size="${kof_storage_size:-10Gi}"
     kof_registry="${kof_registry:-registry.mirantis.com/k0rdent-enterprise}"
     kof_kcm_namespace="${kof_kcm_namespace:-k0rdent}"
-    kof_grafana_enabled="${kof_grafana_enabled:-false}"
+    # Lean-mode dashboard prune lists, comma-separated (folder names contain spaces)
+    kof_lean_prune_folders="${kof_lean_prune_folders:-Istio,Opencost,Victoria Traces}"
+    kof_lean_prune_dashboards="${kof_lean_prune_dashboards:-kps-nodes-aix,kps-nodes-darwin}"
+    kof_grafana_enabled="${kof_grafana_enabled:-true}"
     kof_grafana_image_tag="${kof_grafana_image_tag:-11.0.0}"
     kof_grafana_gateway_enabled="${kof_grafana_gateway_enabled:-false}"
     kof_grafana_nodeport="${kof_grafana_nodeport:-33002}"
@@ -2259,7 +2264,7 @@ print_deploy_summary() {
     bline "    ${lb_remaining}"
     if [[ "${kof_enabled:-false}" == "true" ]]; then
         sep
-        bline "  KOF (observability / M2M)"
+        bline "  KOF (observability / M2M, mode=${kof_mode:-full})"
         if [[ "${kof_grafana_enabled:-false}" == "true" && "${kof_grafana_gateway_enabled:-false}" == "true" ]]; then
             bline "    Grafana (HTTPS, self-signed):"
             local chunk=$(( W - 6 )) gurl="https://${lb_dns}:${kof_grafana_lb_port}"
@@ -2883,6 +2888,8 @@ kof_preflight() {
         || die "Cluster not reachable via KUBECONFIG=${KUBECONFIG}. Deploy the cluster first."
     [[ -f "${PROJECT_ROOT}/kof/global-values.yaml" ]] \
         || die "Missing committed asset ${PROJECT_ROOT}/kof/global-values.yaml."
+    [[ -f "${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml" ]] \
+        || die "Missing KOF profile asset ${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml (kof_mode=${kof_mode})."
     [[ "${kof_grafana_enabled}" != "true" || -f "${PROJECT_ROOT}/kof/grafana.yaml" ]] \
         || die "kof_grafana_enabled=true but missing committed asset ${PROJECT_ROOT}/kof/grafana.yaml."
     if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
@@ -2893,6 +2900,10 @@ kof_preflight() {
     fi
     kubectl get ns "${kof_kcm_namespace}" >/dev/null 2>&1 \
         || die "k0rdent (KCM) namespace '${kof_kcm_namespace}' not found. Set kof_kcm_namespace in config to the namespace where k0rdent runs (check 'kubectl get ns')."
+    # HA (cluster) storage is the only supported topology today; single-node
+    # (vmsingle / single VictoriaLogs) is a future seam pending chart support.
+    [[ "${kof_storage_ha}" == "true" ]] \
+        || die "kof_storage_ha=false (single-node storage) is not yet implemented — keep kof_storage_ha=true."
 }
 
 # Echo a usable StorageClass: cluster default, else 'nfs-client', else die.
@@ -2909,6 +2920,52 @@ kof_resolve_storageclass() {
         fi
     fi
     printf '%s\n' "${sc}"
+}
+
+# Lean-mode dashboard curation. The kof-dashboards subchart renders a
+# GrafanaDashboard CR for EVERY bundled dashboard unconditionally (no per-folder
+# values toggle), so disabling the OpenCost/VictoriaTraces components leaves their
+# dashboards behind showing "No data". Prune them (and OS-specific clutter) after
+# the chart settles. Selection is by Grafana folder (kof_lean_prune_folders,
+# comma-separated since folder names contain spaces) and by dashboard name
+# (kof_lean_prune_dashboards). Idempotent and re-run every deploy: helm recreates
+# the CRs, this removes them again. Robust because Flux v2 HelmReleases do not
+# drift-correct deleted child resources unless driftDetection is explicitly on.
+kof_prune_dashboards() {
+    if [[ "${kof_grafana_enabled}" != "true" ]]; then
+        info "Grafana disabled — no dashboards to prune."
+        return 0
+    fi
+    local folders="${kof_lean_prune_folders}" names="${kof_lean_prune_dashboards}"
+    if [[ -z "${folders}" && -z "${names}" ]]; then
+        return 0
+    fi
+    info "Lean: pruning dashboards (folders: [${folders:-none}]; names: [${names:-none}])..."
+
+    local to_delete
+    to_delete="$(kubectl get grafanadashboard -n kof -o json 2>/dev/null \
+        | FOLDERS="${folders}" NAMES="${names}" jq -r '
+            ($ENV.FOLDERS | split(",") | map(select(length > 0))) as $folders
+          | ($ENV.NAMES   | split(",") | map(select(length > 0))) as $names
+          | .items[]
+          | (.spec.folder // "") as $f
+          | .metadata.name as $n
+          | select(($folders | index($f)) != null or ($names | index($n)) != null)
+          | $n')"
+
+    if [[ -z "${to_delete}" ]]; then
+        info "  No matching dashboards found (already pruned, or chart layout changed)."
+        return 0
+    fi
+
+    local count=0 d
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        kubectl delete grafanadashboard -n kof "${d}" --ignore-not-found >/dev/null 2>&1 \
+            && count=$((count + 1))
+    done <<< "${to_delete}"
+    success "Pruned ${count} Lean dashboard(s)."
+    return 0
 }
 
 # MKE4k ships a built-in ucpauthz Validating Admission Policy that blocks
@@ -3017,12 +3074,23 @@ kof_install_grafana_gateway() {
 }
 
 cmd_deploy_kof() {
+    local mode_arg="${1:-}"
     load_config
+
+    # Resolve deployment mode: CLI positional overrides config (kof_mode).
+    #   full = complete observability + FinOps platform (default)
+    #   lean = cluster monitoring only (drops tracing + FinOps + dead dashboards)
+    local mode="${mode_arg:-${kof_mode}}"
+    case "${mode}" in
+        full|lean) kof_mode="${mode}" ;;
+        *) die "Unknown KOF mode '${mode}'. Try: full, lean." ;;
+    esac
+
     kof_preflight
 
     local sc
     sc="$(kof_resolve_storageclass)"
-    info "KOF deploy: version=${kof_version} storageClass=${sc} kcmNamespace=${kof_kcm_namespace} registry=${kof_registry}"
+    info "KOF deploy: mode=${kof_mode} version=${kof_version} storageClass=${sc} kcmNamespace=${kof_kcm_namespace} registry=${kof_registry}"
 
     # Must run before the chart install so the operator can create collector
     # DaemonSets without being rejected by MKE's admission policy.
@@ -3044,6 +3112,7 @@ cmd_deploy_kof() {
     trap "rm -rf '${workdir}'" RETURN
 
     cp "${PROJECT_ROOT}/kof/global-values.yaml" "${workdir}/global-values.yaml"
+    cp "${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml" "${workdir}/profile.yaml"
     cd "${workdir}"
 
     # Airgap seam (no-op online): repoint every image to a custom registry.
@@ -3076,77 +3145,61 @@ cmd_deploy_kof() {
       | .victoria-metrics-operator.values = $vmo
       | .victoria-metrics-operator.values.global = $g' global-components.yaml
 
-    # M2M patch + resolved StorageClass + KCM namespace.
-    # The KOF umbrella + mothership charts default every k0rdent (KCM) namespace
-    # to "kcm-system", but MKE4k's k0rdent Enterprise build runs KCM in
-    # ${kof_kcm_namespace}. Repoint all of them, or helm pre-install hooks fail
-    # with 'namespaces "kcm-system" not found':
+    # Runtime overlay — ONLY values that must be computed at deploy time: the
+    # resolved StorageClass and the k0rdent (KCM) namespace repointing. The KOF
+    # umbrella + mothership charts default every KCM namespace to "kcm-system",
+    # but MKE4k's k0rdent Enterprise build runs KCM in ${kof_kcm_namespace};
+    # repoint all of them or helm pre-install hooks fail with
+    # 'namespaces "kcm-system" not found':
     #   - global.helmRepo.namespace            : umbrella Flux HelmRepository/HelmChart
     #   - kof-mothership.values.kcm.namespace   : KCM integration
     #   - kof-mothership.values.*-service-template.namespace : kgst hooks create a
     #     Flux HelmRepository per ServiceTemplate (cert-manager/ingress-nginx/envoy)
     #   - kof-collectors.values.kcm.namespace + global.clusterNamespace
-    # M2M is self-monitoring only: kof-regional / kof-child install regional/child
-    # cluster templates (and pull in istio/external-dns/envoy service templates),
-    # none of which apply here — disable them (also avoids their kcm-system hooks).
-    # The mothership cluster labels are aligned to the same namespace for a
-    # consistent cluster identity.
-    # KOF's bundled prometheus-node-exporter defaults to hostNetwork: true, so it
-    # binds the node's :9100 — which MKE4k's built-in monitoring node-exporter
-    # already owns on every node, leaving KOF's pods Pending ("no free ports").
-    # Run KOF's on the pod network instead (hostNetwork: false): it gets a pod IP,
-    # binds 9100 only in its own netns, and is scraped via its pod endpoint through
-    # the ServiceMonitor. This matches how KOF coexists with an existing
-    # host-networked node-exporter on real clusters. (CPU/mem/disk metrics come
-    # from the /host hostPath mounts and are unaffected; only network-interface
-    # metrics reflect the pod netns.)
+    # The component SCOPE (what's enabled, the prometheus-node-exporter :9100 fix,
+    # the kof-regional/kof-child M2M disable, cluster identity) now lives in the
+    # editable kof/profiles/<mode>.yaml overlay copied above — edit that to tune
+    # what KOF deploys. This overlay only carries the deploy-time substitutions.
     SC="${sc}" KCM_NS="${kof_kcm_namespace}" yq -n '
         .global.helmRepo.namespace = strenv(KCM_NS)
-      | .["kof-regional"].enabled = false
-      | .["kof-child"].enabled = false
       | .["kof-mothership"].values.global.storageClass = strenv(SC)
       | .["kof-mothership"].values.kcm.namespace = strenv(KCM_NS)
       | .["kof-mothership"].values["cert-manager-service-template"].namespace = strenv(KCM_NS)
       | .["kof-mothership"].values["ingress-nginx-service-template"].namespace = strenv(KCM_NS)
       | .["kof-mothership"].values["envoy-gateway-service-template"].namespace = strenv(KCM_NS)
-      | .["kof-storage"].enabled = true
       | .["kof-storage"].values.global.storageClass = strenv(SC)
-      | .["kof-collectors"].enabled = true
-      | .["kof-collectors"].values.kcm.monitoring = true
       | .["kof-collectors"].values.kcm.namespace = strenv(KCM_NS)
       | .["kof-collectors"].values.global.clusterNamespace = strenv(KCM_NS)
-      | .["kof-collectors"].values["opentelemetry-kube-stack"]["prometheus-node-exporter"].hostNetwork = false
-      | .["kof-collectors"].values["opentelemetry-kube-stack"].clusterName = "mothership"
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.processors["resource/k8sclustername"].attributes = [
             {"action": "insert", "key": "k8s.cluster.name", "value": "mothership"},
             {"action": "insert", "key": "k8s.cluster.namespace", "value": strenv(KCM_NS)}
         ]
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.cluster = "mothership"
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.clusterNamespace = strenv(KCM_NS)
-    ' > kof-values.yaml
+    ' > runtime.yaml
     # NOTE: MKE4k is k0s and KOF's default PKI_PATH is already var/lib/k0s, so NO
     # collector env override (PKI_PATH) is needed here. Only non-k0s clusters
-    # (e.g. kind -> etc/kubernetes) require it. Add it under
-    # opentelemetry-kube-stack.defaultCRConfig.env only if etcd-metrics scraping
-    # fails on a given MKE4k build.
+    # (e.g. kind -> etc/kubernetes) require it.
 
-    # Grafana (opt-in): turn on the grafana-operator + the mothership's Grafana
-    # datasources/dashboards/admin-secret. The Grafana *instance* itself is applied
-    # separately after install (kof_install_grafana) — the chart does not create it.
+    # Grafana (on by default in both modes): turn on the grafana-operator + the
+    # mothership's Grafana datasources/dashboards/admin-secret. The Grafana
+    # *instance* itself is applied separately after install (kof_install_grafana) —
+    # the chart does not create it.
     if [[ "${kof_grafana_enabled}" == "true" ]]; then
         yq -i '
             .["kof-operators"].values["grafana-operator"].enabled = true
           | .["kof-mothership"].values.grafana.enabled = true
-        ' kof-values.yaml
+        ' runtime.yaml
     fi
 
-    info "Installing KOF umbrella chart (helm v3, FluxCD-sequenced)..."
+    info "Installing KOF umbrella chart (mode=${kof_mode}, helm v3, FluxCD-sequenced)..."
     helm upgrade -i --reset-values --wait \
         --create-namespace -n kof kof \
         "oci://${kof_registry}/charts/kof" \
         --version "${kof_version}" \
         -f global-components.yaml \
-        -f kof-values.yaml
+        -f profile.yaml \
+        -f runtime.yaml
 
     info "Waiting for KOF HelmReleases to become Ready (Flux-driven)..."
     kubectl wait --for=condition=Ready helmreleases --all -n kof --timeout=10m || true
@@ -3160,9 +3213,16 @@ cmd_deploy_kof() {
         fi
     fi
 
+    # Lean: prune the dashboards that have no backing data (tracing/FinOps removed,
+    # plus platform/OS-specific clutter). The chart renders every dashboard CR
+    # unconditionally, so curation has to happen post-install.
+    if [[ "${kof_mode}" == "lean" ]]; then
+        kof_prune_dashboards
+    fi
+
     cd "${PROJECT_ROOT}"
     echo ""
-    echo -e "  ${BOLD}KOF access (self-monitoring / M2M):${RESET}"
+    echo -e "  ${BOLD}KOF access (self-monitoring / M2M, mode=${kof_mode}):${RESET}"
     echo -e "    List services:  kubectl get svc -n kof"
     if [[ "${kof_grafana_enabled}" == "true" ]]; then
         if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
@@ -4751,7 +4811,7 @@ usage() {
     echo "  deploy nfs                  Setup NFS server + CSI driver (cluster must exist)"
     echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
     echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
-    echo "  deploy kof                  Deploy KOF observability/FinOps (self-monitoring; cluster must exist)"
+    echo "  deploy kof [full|lean]      Deploy KOF observability/FinOps (self-monitoring; default kof_mode)"
     echo "  deploy k0rdent-ui           Rotate the k0rdent UI password + publish it via Envoy gateway"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
@@ -4832,7 +4892,12 @@ case "${COMMAND}" in
                     *)       die "Unknown variant: t deploy msr4 ${3}. Try: (empty), airgap" ;;
                 esac
                 ;;
-            kof) cmd_deploy_kof ;;
+            kof)
+                case "${3:-}" in
+                    ""|full|lean) cmd_deploy_kof "${3:-}" ;;
+                    *)            die "Unknown variant: t deploy kof ${3}. Try: full, lean." ;;
+                esac
+                ;;
             k0rdent-ui) cmd_deploy_k0rdent_ui ;;
             *)         die "Unknown subcommand: t deploy ${SUBCOMMAND}. Try: lab, instances, cluster, registry, nfs, msr4, kof, k0rdent-ui" ;;
         esac

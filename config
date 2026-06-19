@@ -59,7 +59,12 @@ msr4_replicas=1
 # -- KOF observability (t deploy kof) --
 # WARNING: requires MKE 4.2.0+ (k0rdent Enterprise 1.3.2). Keep false on MKE < 4.2.0.
 kof_enabled=false
-kof_grafana_enabled=false
+# Deployment scope: full | lean
+#   full = complete observability + FinOps platform
+#   lean = cluster monitoring only (drops tracing + FinOps + dead dashboards)
+# Override per-run with: t deploy kof full | t deploy kof lean
+kof_mode="full"
+kof_grafana_enabled=true
 kof_grafana_gateway_enabled=false
 
 # ============================================================
@@ -141,3 +146,9 @@ kof_grafana_nodeport=33002
 kof_grafana_lb_port=8443
 # Namespace where k0rdent (KCM) runs (MKE4k uses "k0rdent", upstream default "kcm-system").
 kof_kcm_namespace="k0rdent"
+# Keep VictoriaMetrics/VictoriaLogs in HA (cluster) topology. Applies to both modes.
+kof_storage_ha=true
+# Lean-mode dashboard prune lists. Folders are comma-separated (names contain spaces);
+# the Grafana folder names come from the kof-dashboards subchart directory layout.
+kof_lean_prune_folders="Istio,Opencost,Victoria Traces"
+kof_lean_prune_dashboards="kps-nodes-aix,kps-nodes-darwin"
