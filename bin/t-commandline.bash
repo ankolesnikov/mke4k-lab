@@ -128,6 +128,10 @@ load_config() {
     kof_enabled="${kof_enabled:-false}"
     kof_mode="${kof_mode:-full}"
     kof_storage_ha="${kof_storage_ha:-true}"
+    # Reuse MKE4's built-in monitoring: drop KOF's duplicate node-exporter (KOF
+    # already scrapes MKE's via cluster-wide ServiceMonitor discovery) + add MKE's
+    # Prometheus as a Grafana datasource. KSM is kept (unique k0rdent CR metrics).
+    kof_reuse_mke_monitoring="${kof_reuse_mke_monitoring:-false}"
     kof_version="${kof_version:-1.8.1}"
     kof_storage_size="${kof_storage_size:-10Gi}"
     kof_registry="${kof_registry:-registry.mirantis.com/k0rdent-enterprise}"
@@ -2280,6 +2284,10 @@ print_deploy_summary() {
         else
             bline "    Grafana: not enabled (kof_grafana_enabled)"
         fi
+        if [[ "${kof_reuse_mke_monitoring:-false}" == "true" ]]; then
+            bline "    Reusing MKE monitoring (no KOF node-exporter)"
+            bline "    + MKE Prometheus datasource in Grafana"
+        fi
     fi
     sep
     bline "  kubectl get nodes"
@@ -2904,6 +2912,15 @@ kof_preflight() {
     # (vmsingle / single VictoriaLogs) is a future seam pending chart support.
     [[ "${kof_storage_ha}" == "true" ]] \
         || die "kof_storage_ha=false (single-node storage) is not yet implemented — keep kof_storage_ha=true."
+    if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
+        [[ "${kof_grafana_enabled}" != "true" || -f "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml" ]] \
+            || die "kof_reuse_mke_monitoring=true but missing committed asset ${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml."
+        # Soft checks: the reuse depends on MKE's monitoring stack being present.
+        kubectl get ns mke >/dev/null 2>&1 \
+            || warn "kof_reuse_mke_monitoring=true but namespace 'mke' not found — MKE monitoring may be absent; node metrics could go missing."
+        kubectl get svc prometheus-operated -n mke >/dev/null 2>&1 \
+            || warn "MKE Prometheus service 'prometheus-operated' not found in ns 'mke' — the MKE Prometheus datasource will not resolve."
+    fi
 }
 
 # Echo a usable StorageClass: cluster default, else 'nfs-client', else die.
@@ -3031,6 +3048,18 @@ kof_install_grafana() {
     info "Waiting for Grafana instance to become ready..."
     kubectl wait grafana grafana-vm -n kof \
         --for=jsonpath='{.status.stageStatus}'=success --timeout=5m || true
+    return 0
+}
+
+# Register MKE4's built-in Prometheus (svc prometheus-operated.mke:9090) as an
+# extra datasource in KOF's Grafana — a one-pane view alongside KOF's
+# VictoriaMetrics. Applied when kof_reuse_mke_monitoring=true. Must run after the
+# chart install so the GrafanaDatasource CRD + grafana-operator exist.
+kof_add_mke_datasource() {
+    info "Adding MKE Prometheus as a Grafana datasource (prometheus-operated.mke:9090)..."
+    kubectl wait --for=condition=Established \
+        crd/grafanadatasources.grafana.integreatly.org --timeout=5m || true
+    kubectl apply -n kof -f "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml"
     return 0
 }
 
@@ -3192,6 +3221,18 @@ cmd_deploy_kof() {
         ' runtime.yaml
     fi
 
+    # Reuse MKE4's monitoring: drop KOF's own node-exporter DaemonSet. KOF's
+    # target-allocator already discovers MKE's node-exporter ServiceMonitor
+    # (ns mke) cluster-wide with the identical job="node-exporter" label, so the
+    # node dashboards stay populated from MKE's exporter — this just removes the
+    # duplicate pod-per-node. KSM is deliberately left enabled: KOF's KSM emits
+    # the k0rdent custom-resource metrics (kube_customresource_*) that MKE's
+    # vanilla KSM does not.
+    if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
+        info "Reusing MKE monitoring: disabling KOF's duplicate node-exporter."
+        yq -i '.["kof-collectors"].values["opentelemetry-kube-stack"].nodeExporter.enabled = false' runtime.yaml
+    fi
+
     info "Installing KOF umbrella chart (mode=${kof_mode}, helm v3, FluxCD-sequenced)..."
     helm upgrade -i --reset-values --wait \
         --create-namespace -n kof kof \
@@ -3210,6 +3251,9 @@ cmd_deploy_kof() {
         kof_install_grafana
         if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
             kof_install_grafana_gateway
+        fi
+        if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
+            kof_add_mke_datasource
         fi
     fi
 
@@ -3249,6 +3293,10 @@ cmd_deploy_kof() {
     echo -e "                    then open http://localhost:9471/select/vmui/"
     echo -e "    Metrics (VMUI): kubectl -n kof port-forward svc/vmselect-cluster 8481:8481"
     echo -e "                    then open http://localhost:8481/select/0/vmui/"
+    if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
+        echo -e "    MKE reuse:      KOF node-exporter disabled; node metrics scraped from MKE's (ns mke)"
+        echo -e "                    'MKE Prometheus' datasource added to Grafana (prometheus-operated.mke:9090)"
+    fi
     echo ""
     success "KOF deployed."
     return 0

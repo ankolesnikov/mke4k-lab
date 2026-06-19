@@ -66,6 +66,11 @@ kof_enabled=false
 kof_mode="full"
 kof_grafana_enabled=true
 kof_grafana_gateway_enabled=false
+# Reuse MKE4's built-in monitoring instead of duplicating it: drops KOF's own
+# node-exporter (KOF already scrapes MKE's, same job label) and adds MKE's
+# Prometheus as a Grafana datasource. KOF's kube-state-metrics is kept (it emits
+# k0rdent custom-resource metrics MKE's does not). Default off.
+kof_reuse_mke_monitoring=false
 
 # ============================================================
 #  2. Airgap settings   (only for 't deploy lab airgap' / 'mke3-airgap')
