@@ -132,6 +132,9 @@ load_config() {
     # already scrapes MKE's via cluster-wide ServiceMonitor discovery) + add MKE's
     # Prometheus as a Grafana datasource. KSM is kept (unique k0rdent CR metrics).
     kof_reuse_mke_monitoring="${kof_reuse_mke_monitoring:-false}"
+    # Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so
+    # pod CPU/memory aren't double-counted. On by default when reuse is enabled.
+    kof_reuse_mke_kubelet="${kof_reuse_mke_kubelet:-true}"
     kof_version="${kof_version:-1.8.1}"
     kof_storage_size="${kof_storage_size:-10Gi}"
     kof_registry="${kof_registry:-registry.mirantis.com/k0rdent-enterprise}"
@@ -3116,6 +3119,48 @@ kof_apply_node_label_transform() {
     return 0
 }
 
+# Remove KOF's duplicate kubelet/cAdvisor scrape so MKE's kubelet ServiceMonitor
+# is the single source (kof_reuse_mke_kubelet). KOF's daemon collectors scrape
+# each node's kubelet :10250 directly via prometheus scrape_configs jobs
+# (kubelet-cadvisor / kubelet / kubelet-resources / kubelet-probes) — NOT a
+# ServiceMonitor and NOT the kubeletMetrics preset (that's the separate, OTEL-only
+# kubeletstats receiver). Both KOF's and MKE's land in KOF's VM, so container_*
+# and kubelet_* metrics are double-counted and any sum-by-pod panel over-reports
+# (verified: a 2m pod showed ~10m). Dropping the kubelet* jobs (keeping
+# kubernetes-pods) leaves MKE's kubelet SM as the single, accurate source.
+# Post-install reconcile (the scrape_configs list is too large to override in
+# values; Flux-managed CR, so re-applied each deploy). Idempotent: skips a
+# collector that already has no kubelet* jobs. Touches both daemon collectors
+# (worker + control-plane). NOTE: trades KOF's richer cAdvisor series set for
+# MKE's kube-prometheus-stack-filtered set; the standard dashboards are built
+# against the filtered set, so this is accuracy-positive.
+kof_apply_kubelet_dedup() {
+    local cr pf has rolled=0
+    for cr in kof-collectors-daemon kof-collectors-controller-k0s-daemon; do
+        kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 || continue
+        has="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+            | jq -r '[.spec.config.receivers.prometheus.config.scrape_configs[]?.job_name
+                      | select(startswith("kubelet"))] | length')"
+        if [[ -z "${has}" || "${has}" == "0" ]]; then
+            info "  ${cr}: no kubelet* scrape jobs (already deduped) — skipping."
+            continue
+        fi
+        info "  ${cr}: dropping ${has} kubelet* scrape job(s) (reuse-MKE kubelet dedup)..."
+        pf="$(mktemp "${TMPDIR:-/tmp}/kof-nokubelet-XXXX.json")"
+        kubectl -n kof get opentelemetrycollector "${cr}" -o json \
+            | jq '.spec.config.receivers.prometheus.config.scrape_configs
+                  |= map(select(.job_name | startswith("kubelet") | not))
+                | {spec:{config:{receivers:{prometheus:{config:{scrape_configs:
+                    .spec.config.receivers.prometheus.config.scrape_configs}}}}}}' > "${pf}"
+        kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${pf}"
+        rm -f "${pf}"
+        kubectl -n kof rollout restart "ds/${cr}-collector" >/dev/null 2>&1 || true
+        rolled=1
+    done
+    [[ "${rolled}" == "1" ]] && success "Kubelet dedup applied (MKE's kubelet ServiceMonitor is now the single source)."
+    return 0
+}
+
 # Apply the dedicated Grafana Envoy Gateway (Issuer/Certificate/EnvoyProxy/Gateway/
 # HTTPRoute). Pins the Envoy NodePort to kof_grafana_nodeport so the terraform NLB
 # target group hits a known port, and fills the cert SANs from terraform output.
@@ -3292,15 +3337,10 @@ cmd_deploy_kof() {
     #     cluster-wide target-allocator also discovers MKE's, so they're
     #     double-scraped. Disable KOF's SMs; MKE's (monitoring-kube-prometheus-*)
     #     remain the single source (verified live: single source after disable).
+    #   - kubelet/cAdvisor: handled SEPARATELY below (kof_apply_kubelet_dedup,
+    #     gated on kof_reuse_mke_kubelet) — it's not a values toggle but a
+    #     post-install scrape_config edit on the daemon collectors.
     #   NOT deduped, deliberately:
-    #   - kubelet/cAdvisor: KOF's daemon collector scrapes each node's kubelet
-    #     :10250 directly (a core function of the custom kof collector image, via
-    #     the daemon's kubeletMetrics preset — NOT a ServiceMonitor toggle). It is
-    #     the PRIMARY container-metrics source (live: 454 container series vs MKE's
-    #     319 — not equivalent), so disabling it would drop series the resource
-    #     dashboards use AND saves no pods (the daemon stays for logs/hostmetrics).
-    #     The cost of keeping it is cosmetic: the Kubelet dashboard's count panels
-    #     (Running Kubelets/Pods) read 2x; per-node/per-pod panels are fine.
     #   - apiserver/scheduler/controller-manager: no live MKE source (k0s runs
     #     them as host processes) — disabling KOF's would lose them.
     #   - etcd: apparent doubling is a k0s-pushgateway re-export (job=etcd from
@@ -3347,6 +3387,15 @@ cmd_deploy_kof() {
     # own node-exporter. Runs regardless of Grafana (it fixes the data in VM).
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
         kof_apply_node_label_transform
+    fi
+
+    # Reuse-MKE-monitoring: drop KOF's duplicate kubelet/cAdvisor scrape so MKE's
+    # kubelet ServiceMonitor is the single source (fixes 2x over-reported pod
+    # CPU/memory). Opt-out via kof_reuse_mke_kubelet=false (keeps KOF's richer set
+    # at the cost of double-counting).
+    if [[ "${kof_reuse_mke_monitoring}" == "true" && "${kof_reuse_mke_kubelet}" == "true" ]]; then
+        info "Reusing MKE monitoring: deduplicating kubelet/cAdvisor scrapes..."
+        kof_apply_kubelet_dedup
     fi
 
     # Lean: prune the dashboards that have no backing data (tracing/FinOps removed,
