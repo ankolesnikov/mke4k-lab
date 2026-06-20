@@ -67,8 +67,8 @@ kof_mode="full"
 kof_grafana_enabled=true
 kof_grafana_gateway_enabled=false
 # Reuse MKE4's built-in monitoring instead of duplicating it: drops KOF's own
-# node-exporter + kube-proxy/coredns scrapes (KOF already scrapes MKE's, same
-# labels), makes KOF's kube-state-metrics custom-resource-only (MKE serves the
+# node-exporter + kube-proxy/coredns/apiserver scrapes (KOF already scrapes MKE's,
+# same labels), makes KOF's kube-state-metrics custom-resource-only (MKE serves the
 # standard kube_* metrics), and adds MKE's Prometheus as a Grafana datasource.
 # Default off.
 kof_reuse_mke_monitoring=false

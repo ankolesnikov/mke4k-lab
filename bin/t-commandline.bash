@@ -3337,20 +3337,31 @@ cmd_deploy_kof() {
     #     cluster-wide target-allocator also discovers MKE's, so they're
     #     double-scraped. Disable KOF's SMs; MKE's (monitoring-kube-prometheus-*)
     #     remain the single source (verified live: single source after disable).
+    #   - apiserver: BOTH KOF's SM (kof-collectors-apiserver) and MKE's
+    #     (monitoring-kube-prometheus-apiserver) relabel job=apiserver and scrape
+    #     the SAME single endpoint (the kubernetes svc -> apiserver host process),
+    #     so the series collapse to one (no double-count — verified live, count=1)
+    #     but the heaviest /metrics endpoint in the cluster is scraped twice. This
+    #     is a load/noise fix, not an accuracy fix: disabling KOF's SM halves that
+    #     scrape and clears the target-allocator "duplicated targets" warning;
+    #     MKE's SM remains the single source (KOF's cluster-wide TA still scrapes
+    #     it, so the apiserver dashboards stay populated — verified live).
     #   - kubelet/cAdvisor: handled SEPARATELY below (kof_apply_kubelet_dedup,
     #     gated on kof_reuse_mke_kubelet) — it's not a values toggle but a
     #     post-install scrape_config edit on the daemon collectors.
     #   NOT deduped, deliberately:
-    #   - apiserver/scheduler/controller-manager: no live MKE source (k0s runs
-    #     them as host processes) — disabling KOF's would lose them.
+    #   - scheduler/controller-manager: no live MKE source (k0s runs them as host
+    #     processes bound to localhost; only KOF's local daemon collector reaches
+    #     them) — disabling KOF's would lose them.
     #   - etcd: apparent doubling is a k0s-pushgateway re-export (job=etcd from
     #     k0s-pushgateway), not an MKE overlap.
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
-        info "Reusing MKE monitoring: disabling KOF's node-exporter + kube-proxy/coredns scrapes + KOF KSM custom-resource-only."
+        info "Reusing MKE monitoring: disabling KOF's node-exporter + kube-proxy/coredns/apiserver scrapes + KOF KSM custom-resource-only."
         yq -i '
             .["kof-collectors"].values["opentelemetry-kube-stack"].nodeExporter.enabled = false
           | .["kof-collectors"].values["opentelemetry-kube-stack"].kubeProxy.enabled = false
           | .["kof-collectors"].values["opentelemetry-kube-stack"].coreDns.enabled = false
+          | .["kof-collectors"].values["opentelemetry-kube-stack"].kubeApiServer.enabled = false
           | .["kof-collectors"].values["opentelemetry-kube-stack"]["kube-state-metrics"].extraArgs = [
                 "--custom-resource-state-config-file=/etc/config/crd-metrics-config.yaml",
                 "--custom-resource-state-only"
