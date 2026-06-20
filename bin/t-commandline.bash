@@ -3274,16 +3274,29 @@ cmd_deploy_kof() {
         ' runtime.yaml
     fi
 
-    # Reuse MKE4's monitoring: drop KOF's own node-exporter DaemonSet. KOF's
-    # target-allocator already discovers MKE's node-exporter ServiceMonitor
-    # (ns mke) cluster-wide with the identical job="node-exporter" label, so the
-    # node dashboards stay populated from MKE's exporter — this just removes the
-    # duplicate pod-per-node. KSM is deliberately left enabled: KOF's KSM emits
-    # the k0rdent custom-resource metrics (kube_customresource_*) that MKE's
-    # vanilla KSM does not.
+    # Reuse MKE4's monitoring: drop KOF's own node-exporter DaemonSet, and make
+    # KOF's kube-state-metrics emit ONLY the k0rdent custom-resource metrics.
+    # KOF's target-allocator already discovers MKE's node-exporter + KSM
+    # ServiceMonitors (ns mke) cluster-wide with identical labels, so:
+    #   - node-exporter: disable KOF's entirely; node dashboards stay populated
+    #     from MKE's exporter (removes the duplicate pod-per-node). Needs the
+    #     node-label transform (kof_apply_node_label_transform) since MKE's SM
+    #     doesn't set the `node` label KOF's dashboards key on.
+    #   - KSM: KOF's is NOT disabled (it uniquely emits kube_customresource_*
+    #     for k0rdent CRs that MKE's vanilla KSM lacks) — instead add
+    #     --custom-resource-state-only so it stops duplicating the standard
+    #     kube_* series, which MKE's KSM then serves alone (no doubled counts).
+    #     extraArgs is a list (helm REPLACES it), so the existing config-file arg
+    #     must be repeated. Path/arg are chart-pinned to kof_version 1.8.1.
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
-        info "Reusing MKE monitoring: disabling KOF's duplicate node-exporter."
-        yq -i '.["kof-collectors"].values["opentelemetry-kube-stack"].nodeExporter.enabled = false' runtime.yaml
+        info "Reusing MKE monitoring: disabling KOF's node-exporter + making KOF KSM custom-resource-only."
+        yq -i '
+            .["kof-collectors"].values["opentelemetry-kube-stack"].nodeExporter.enabled = false
+          | .["kof-collectors"].values["opentelemetry-kube-stack"]["kube-state-metrics"].extraArgs = [
+                "--custom-resource-state-config-file=/etc/config/crd-metrics-config.yaml",
+                "--custom-resource-state-only"
+            ]
+        ' runtime.yaml
     fi
 
     info "Installing KOF umbrella chart (mode=${kof_mode}, helm v3, FluxCD-sequenced)..."
