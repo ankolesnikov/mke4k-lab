@@ -3288,10 +3288,21 @@ cmd_deploy_kof() {
     #     kube_* series, which MKE's KSM then serves alone (no doubled counts).
     #     extraArgs is a list (helm REPLACES it), so the existing config-file arg
     #     must be repeated. Path/arg are chart-pinned to kof_version 1.8.1.
+    #   - kubelet / kube-proxy / coredns: KOF ships its own ServiceMonitor for
+    #     each AND its cluster-wide target-allocator also discovers MKE's, so
+    #     these are double-scraped (e.g. Running Kubelets shows 2x nodes). Disable
+    #     KOF's SMs; MKE's (monitoring-kube-prometheus-*) remain the single source.
+    #     Only these three are deduped: apiserver/scheduler/controller-manager have
+    #     no live MKE source (k0s runs them as host processes — disabling KOF's
+    #     would lose them), and etcd's apparent doubling is a k0s-pushgateway
+    #     re-export (job=etcd from k0s-pushgateway), not an MKE overlap.
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
-        info "Reusing MKE monitoring: disabling KOF's node-exporter + making KOF KSM custom-resource-only."
+        info "Reusing MKE monitoring: disabling KOF's node-exporter + kubelet/kube-proxy/coredns scrapes + KOF KSM custom-resource-only."
         yq -i '
             .["kof-collectors"].values["opentelemetry-kube-stack"].nodeExporter.enabled = false
+          | .["kof-collectors"].values["opentelemetry-kube-stack"].kubelet.enabled = false
+          | .["kof-collectors"].values["opentelemetry-kube-stack"].kubeProxy.enabled = false
+          | .["kof-collectors"].values["opentelemetry-kube-stack"].coreDns.enabled = false
           | .["kof-collectors"].values["opentelemetry-kube-stack"]["kube-state-metrics"].extraArgs = [
                 "--custom-resource-state-config-file=/etc/config/crd-metrics-config.yaml",
                 "--custom-resource-state-only"
