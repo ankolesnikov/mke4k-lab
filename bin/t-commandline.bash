@@ -3066,27 +3066,38 @@ kof_add_mke_datasource() {
     return 0
 }
 
-# Companion to dropping KOF's node-exporter (kof_reuse_mke_monitoring): MKE's
-# node-exporter ServiceMonitor does NOT add the node-identity target labels KOF's
-# dashboards key on. KOF's own node-exporter scrape relabeled BOTH `node` and
-# `nodename` onto every node_* series, and different KOF dashboards use different
-# ones: node-exporter-full's Host picker is label_values(node_uname_info, node),
-# while other node panels filter node_cpu_seconds_total{nodename="$node"}. MKE's
-# series carry neither, so the host picker is empty AND nodename-keyed panels show
-# no data. Stamp both `node` and `nodename` from the per-node downward-API env var
-# OTEL_K8S_NODE_NAME onto every node_* metric that lacks them, on the target-allocator
-# DaemonSet collector that scrapes node-exporter. Each set is guarded `== nil` so
-# node_uname_info's intrinsic uname `nodename` and KOF's own series (full mode) are
-# never touched. `job` can't be used as the guard — the prometheus receiver promotes
-# it to a resource attribute, so it isn't a datapoint attribute at transform time;
-# the metric-name match is reliable instead. (OTEL_K8S_NODE_NAME is the k8s node
-# name, which on these nodes equals the uname nodename, e.g. ip-172-31-0-113....)
+# Companion to dropping KOF's node-exporter + reusing MKE's kubelet
+# (kof_reuse_mke_monitoring / kof_reuse_mke_kubelet): MKE's node-exporter AND kubelet
+# ServiceMonitors do NOT add the node-identity target labels KOF's dashboards key on.
+# KOF's own scrapes relabeled BOTH `node` and `nodename` onto every series, and KOF
+# dashboards filter on BOTH across THREE metric families:
+#   - node_*      (node-exporter)  e.g. node_cpu_seconds_total{nodename="$node"}
+#   - machine_*   (cAdvisor)       e.g. machine_memory_bytes{nodename="$node"} (CPU/RAM Total)
+#   - container_* (cAdvisor)       e.g. container_cpu_usage_seconds_total{nodename="$node"} (by-Pod)
+#   - kubelet_*   (kubelet)        e.g. kubelet_volume_stats_used_bytes{nodename="$node"} (PVC stats)
+# Also the node-exporter-full Host picker is label_values(node_uname_info, node).
+# MKE's series carry neither label, so the host picker is empty AND every
+# nodename-keyed panel (CPU/RAM Total, CPU/Mem usage by Pod, PVC volume stats, etc.)
+# shows no data. Stamp both `node` and `nodename` from the per-node downward-API env
+# var OTEL_K8S_NODE_NAME onto every node_*/machine_*/container_*/kubelet_* metric
+# that lacks them, on the target-allocator DaemonSet collector. This is correct
+# because the daemon TA allocates each node's targets (node-exporter + kubelet, both
+# per-node) to the collector ON that node (proven: the node-exporter fix landed
+# distinct per-node FQDNs — non-local allocation would have collapsed them). The set
+# is an ALLOWLIST of per-node metric families, NOT "stamp everything missing
+# nodename": the same collector also scrapes cluster-scoped SM targets (KSM kube_*,
+# MKE's apiserver/coredns) and stamping those with the collector's node would be
+# wrong. Each set is also guarded `== nil` so node_uname_info's intrinsic uname
+# `nodename` and KOF's own series (full mode) are never touched. `job` can't be used as the guard — the prometheus receiver promotes it to
+# a resource attribute, so it isn't a datapoint attribute at transform time; the
+# metric-name match is reliable instead. (OTEL_K8S_NODE_NAME is the k8s node name,
+# which on these nodes equals the uname nodename, e.g. ip-172-31-0-113....)
 # The OpenTelemetryCollector is Flux-managed, so (like kof_prune_dashboards) this is
 # a post-install reconcile re-applied each deploy; the collector is rolled after.
 kof_apply_node_label_transform() {
     local cr="kof-collectors-ta-daemon" ds="kof-collectors-ta-daemon-collector"
-    local stmt_node='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["node"] == nil'
-    local stmt_nodename='set(datapoint.attributes["nodename"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["nodename"] == nil'
+    local stmt_node='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^(node_|machine_|container_|kubelet_)") and datapoint.attributes["node"] == nil'
+    local stmt_nodename='set(datapoint.attributes["nodename"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^(node_|machine_|container_|kubelet_)") and datapoint.attributes["nodename"] == nil'
 
     kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
         || { warn "Collector ${cr} not found — skipping node-label transform."; return 0; }
