@@ -3067,20 +3067,26 @@ kof_add_mke_datasource() {
 }
 
 # Companion to dropping KOF's node-exporter (kof_reuse_mke_monitoring): MKE's
-# node-exporter ServiceMonitor does NOT add the `node` target label KOF's
-# dashboards key on (node-exporter-full's Host = label_values(node_uname_info, node)),
-# so MKE's node_* series arrive without it and the dashboard's host picker is empty.
-# Stamp `node` from the per-node downward-API env var OTEL_K8S_NODE_NAME onto every
-# node_* metric that lacks it, on the target-allocator DaemonSet collector that
-# scrapes node-exporter. Scoped to node_* + node==nil so KSM/kubelet and KOF's own
-# series (full mode) are never touched. `job` can't be used as the guard — the
-# prometheus receiver promotes it to a resource attribute, so it isn't a datapoint
-# attribute at transform time; the metric-name match is reliable instead.
+# node-exporter ServiceMonitor does NOT add the node-identity target labels KOF's
+# dashboards key on. KOF's own node-exporter scrape relabeled BOTH `node` and
+# `nodename` onto every node_* series, and different KOF dashboards use different
+# ones: node-exporter-full's Host picker is label_values(node_uname_info, node),
+# while other node panels filter node_cpu_seconds_total{nodename="$node"}. MKE's
+# series carry neither, so the host picker is empty AND nodename-keyed panels show
+# no data. Stamp both `node` and `nodename` from the per-node downward-API env var
+# OTEL_K8S_NODE_NAME onto every node_* metric that lacks them, on the target-allocator
+# DaemonSet collector that scrapes node-exporter. Each set is guarded `== nil` so
+# node_uname_info's intrinsic uname `nodename` and KOF's own series (full mode) are
+# never touched. `job` can't be used as the guard — the prometheus receiver promotes
+# it to a resource attribute, so it isn't a datapoint attribute at transform time;
+# the metric-name match is reliable instead. (OTEL_K8S_NODE_NAME is the k8s node
+# name, which on these nodes equals the uname nodename, e.g. ip-172-31-0-113....)
 # The OpenTelemetryCollector is Flux-managed, so (like kof_prune_dashboards) this is
 # a post-install reconcile re-applied each deploy; the collector is rolled after.
 kof_apply_node_label_transform() {
     local cr="kof-collectors-ta-daemon" ds="kof-collectors-ta-daemon-collector"
-    local stmt='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["node"] == nil'
+    local stmt_node='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["node"] == nil'
+    local stmt_nodename='set(datapoint.attributes["nodename"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^node_") and datapoint.attributes["nodename"] == nil'
 
     kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
         || { warn "Collector ${cr} not found — skipping node-label transform."; return 0; }
@@ -3104,9 +3110,9 @@ kof_apply_node_label_transform() {
 
     local patch_file
     patch_file="$(mktemp "${TMPDIR:-/tmp}/kof-setnode-XXXX.json")"
-    jq -n --arg s "${stmt}" --argjson procs "${new_json}" '
+    jq -n --arg s1 "${stmt_node}" --arg s2 "${stmt_nodename}" --argjson procs "${new_json}" '
         {spec:{config:{
-            processors:{"transform/setnode":{metric_statements:[{context:"datapoint",statements:[$s]}]}},
+            processors:{"transform/setnode":{metric_statements:[{context:"datapoint",statements:[$s1,$s2]}]}},
             service:{pipelines:{metrics:{processors:$procs}}}
         }}}' > "${patch_file}"
     kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${patch_file}"
