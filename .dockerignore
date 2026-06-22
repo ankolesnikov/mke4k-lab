@@ -27,4 +27,6 @@ mke3/
 .dockerignore
 Dockerfile
 CLAUDE.md
-README.mdkof/MKE4-INTEGRATION.md
+README.md
+kof/MKE4-INTEGRATION.md
+kof/INSTALL-MKE.md
