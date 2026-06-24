@@ -3136,6 +3136,76 @@ kof_apply_node_label_transform() {
     return 0
 }
 
+# Drop the k0s metrics-scraper PUSHGATEWAY's re-export of the control-plane
+# components (kof_reuse_mke_monitoring). On k0s, scheduler/controller-manager/etcd
+# are scraped TWICE and land in KOF's VM:
+#   (1) DIRECT, on the node IP:secure-port (kube-scheduler :10259, kube-controller-
+#       manager :10257, etcd :2381) — per-controller `instance`, full fidelity; and
+#   (2) the k0s pushgateway (ns k0s-system, --enable-metrics-scraper) which
+#       re-exports the SAME series with the real target moved to exported_job/
+#       exported_instance and `instance` collapsed to the pushgateway pod.
+# KOF's cluster-wide target-allocator (on kof-collectors-ta-daemon) discovers the
+# `k0s` ServiceMonitor (ns mke) and scrapes the pushgateway, so both copies exist.
+# Unlike apiserver (both copies hit the same endpoint -> collapse to one series),
+# these carry DIFFERENT `instance` labels and do NOT collapse, so aggregating
+# panels (sum/rate over a control-plane job) double-count (verified live: equal
+# cardinality in ns={} and ns=k0s-system for all three jobs).
+# The clean fix is `--enable-metrics-scraper=false`, but MKE hardcodes it =true
+# AFTER user installFlags (k0s pflag last-wins), so it can't be turned off from
+# mke4.yaml. So we drop the pushgateway copies at the collector instead.
+# Discriminator: `exported_job` — present ONLY on the pushgateway re-export (the
+# direct scrape has no exported_* label), and it stays a DATAPOINT attribute (only
+# `job`/`instance` get promoted to resource attrs by the prometheus receiver — the
+# same gotcha noted in kof_apply_node_label_transform), so it's reliable to match.
+# Same Flux-managed CR + post-install reconcile pattern as the node-label transform.
+kof_apply_k0s_pushgateway_dedup() {
+    local cr="kof-collectors-ta-daemon" ds="kof-collectors-ta-daemon-collector"
+
+    kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
+        || { warn "Collector ${cr} not found — skipping k0s-pushgateway dedup."; return 0; }
+
+    info "Dropping k0s-pushgateway scheduler/controller-manager/etcd re-exports on ${cr}..."
+
+    # Append filter/drop_k0s_pushgateway to the metrics pipeline (before batch,
+    # idempotent) without clobbering transform/setnode or anything the chart ships.
+    local cur_json new_json
+    cur_json="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+        | jq -c '.spec.config.service.pipelines.metrics.processors // []')"
+    if [[ -z "${cur_json}" || "${cur_json}" == "null" ]]; then
+        warn "Could not read ${cr} metrics pipeline — skipping k0s-pushgateway dedup."
+        return 0
+    fi
+    new_json="$(jq -c '
+        if index("filter/drop_k0s_pushgateway") then .
+        elif index("batch") then index("batch") as $b | .[0:$b] + ["filter/drop_k0s_pushgateway"] + .[$b:]
+        else . + ["filter/drop_k0s_pushgateway"] end' <<<"${cur_json}")"
+
+    # Build the whole patch with jq --argjson (embeds the real array; errors loudly
+    # if empty — never writes a literal "$var" that the collector would env-expand).
+    local patch_file
+    patch_file="$(mktemp "${TMPDIR:-/tmp}/kof-pgwdrop-XXXX.json")"
+    jq -n --argjson procs "${new_json}" '
+        {spec:{config:{
+            processors:{"filter/drop_k0s_pushgateway":{
+                error_mode:"ignore",
+                metrics:{datapoint:[
+                    "attributes[\"exported_job\"] == \"kube-scheduler\"",
+                    "attributes[\"exported_job\"] == \"kube-controller-manager\"",
+                    "attributes[\"exported_job\"] == \"etcd\""
+                ]}
+            }},
+            service:{pipelines:{metrics:{processors:$procs}}}
+        }}}' > "${patch_file}"
+    kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${patch_file}"
+    rm -f "${patch_file}"
+
+    # Roll the collector so the operator regenerates its config, then wait it out.
+    kubectl -n kof rollout restart "ds/${ds}" >/dev/null 2>&1 || true
+    kubectl -n kof rollout status "ds/${ds}" --timeout=180s || true
+    success "k0s-pushgateway dedup applied to ${cr}."
+    return 0
+}
+
 # Remove KOF's duplicate kubelet/cAdvisor scrape so MKE's kubelet ServiceMonitor
 # is the single source (kof_reuse_mke_kubelet). KOF's daemon collectors scrape
 # each node's kubelet :10250 directly via prometheus scrape_configs jobs
@@ -3366,12 +3436,27 @@ cmd_deploy_kof() {
     #   - kubelet/cAdvisor: handled SEPARATELY below (kof_apply_kubelet_dedup,
     #     gated on kof_reuse_mke_kubelet) — it's not a values toggle but a
     #     post-install scrape_config edit on the daemon collectors.
-    #   NOT deduped, deliberately:
-    #   - scheduler/controller-manager: no live MKE source (k0s runs them as host
-    #     processes bound to localhost; only KOF's local daemon collector reaches
-    #     them) — disabling KOF's would lose them.
-    #   - etcd: apparent doubling is a k0s-pushgateway re-export (job=etcd from
-    #     k0s-pushgateway), not an MKE overlap.
+    #   NOT deduped (k0s-pushgateway double-count — known, not yet wired):
+    #   - scheduler/controller-manager/etcd: each is scraped TWICE. (1) a DIRECT
+    #     scrape on the node IP:secure-port (kube-scheduler :10259, kube-controller-
+    #     manager :10257, etcd :2381) — per-controller `instance` labels, full
+    #     fidelity; and (2) the k0s metrics-scraper PUSHGATEWAY (ns k0s-system,
+    #     --enable-metrics-scraper) which re-exports the same series with the real
+    #     target moved to exported_job/exported_instance and `instance` collapsed
+    #     to the pushgateway pod. KOF's cluster-wide TA discovers the `k0s`
+    #     ServiceMonitor (ns mke) and scrapes the pushgateway, so BOTH copies land
+    #     in VM. Unlike apiserver (both copies hit the same endpoint -> collapse to
+    #     one series), these carry DIFFERENT `instance` labels and do NOT collapse,
+    #     so aggregating panels (sum/rate over a control-plane job) double-count.
+    #     Components bind to the node IP (NOT localhost) — verified live: series at
+    #     instance=172.31.0.x:10257/10259 — so the direct scrape is the complete,
+    #     authoritative source and the pushgateway copy is pure redundancy.
+    #     The clean fix is `--enable-metrics-scraper=false`, but MKE HARDCODES
+    #     `--enable-metrics-scraper=true` AFTER user installFlags (k0s pflag
+    #     last-wins), so it can't be turned off from mke4.yaml. Instead we drop the
+    #     pushgateway copies at the collector post-install — see
+    #     kof_apply_k0s_pushgateway_dedup() (filter processor on ta-daemon keyed on
+    #     exported_job), called alongside kof_apply_node_label_transform below.
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
         info "Reusing MKE monitoring: disabling KOF's node-exporter + kube-proxy/coredns/apiserver scrapes + KOF KSM custom-resource-only."
         yq -i '
@@ -3415,6 +3500,7 @@ cmd_deploy_kof() {
     # own node-exporter. Runs regardless of Grafana (it fixes the data in VM).
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
         kof_apply_node_label_transform
+        kof_apply_k0s_pushgateway_dedup
     fi
 
     # Reuse-MKE-monitoring: drop KOF's duplicate kubelet/cAdvisor scrape so MKE's
