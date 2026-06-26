@@ -3395,6 +3395,28 @@ cmd_deploy_kof() {
     # collector env override (PKI_PATH) is needed here. Only non-k0s clusters
     # (e.g. kind -> etc/kubernetes) require it.
 
+    # Persist Alertmanager state on a PVC instead of the chart-default EmptyDir.
+    # The mothership's VMAlertmanager (kof-mothership chart key
+    # victoriametrics.vmalert.manager.spec -> CR vmalertmanager-cluster) defaults
+    # to an EmptyDir at /alertmanager, which holds the notification log AND all
+    # SILENCES created via the Grafana/Alertmanager UI. EmptyDir means those are
+    # lost on every pod/STS rollout. Giving the operator a volumeClaimTemplate
+    # makes it mount a PVC at /alertmanager so customer-created silences survive
+    # restarts/upgrades. Always-on: KOF already requires a default StorageClass
+    # (every VictoriaMetrics/Logs PVC binds to one — nfs-client in this lab), so
+    # this adds no new dependency. storageClassName is intentionally omitted to
+    # inherit the cluster default, matching how KOF's own VM PVCs are provisioned.
+    # 1Gi is far more than silences + nflog need (KB-scale) and nfs-client allows
+    # expansion. NOTE on redeploy: STS volumeClaimTemplates are immutable, so the
+    # VM operator recreates the vmalertmanager-cluster STS to apply this — expected
+    # on the first deploy that introduces it.
+    yq -i '
+        .["kof-mothership"].values.victoriametrics.vmalert.manager.spec.storage.volumeClaimTemplate.spec = {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    ' runtime.yaml
+
     # Grafana (on by default in both modes): turn on the grafana-operator + the
     # mothership's Grafana datasources/dashboards/admin-secret. The Grafana
     # *instance* itself is applied separately after install (kof_install_grafana) —
