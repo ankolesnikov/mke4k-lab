@@ -135,6 +135,11 @@ load_config() {
     # Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so
     # pod CPU/memory aren't double-counted. On by default when reuse is enabled.
     kof_reuse_mke_kubelet="${kof_reuse_mke_kubelet:-true}"
+    # Wire the Alertmanager Salesforce route (severity critical|warning|error ->
+    # sf-notifier webhook). sf-notifier itself is deployed by hand (KOF-ON-MKE4.md
+    # §7.8); this only adds the routing. Default off (a route to a missing sf-notifier
+    # fires AlertmanagerFailedToSendAlerts).
+    kof_sf_notifier_enabled="${kof_sf_notifier_enabled:-false}"
     kof_version="${kof_version:-1.8.1}"
     kof_storage_size="${kof_storage_size:-10Gi}"
     kof_registry="${kof_registry:-registry.mirantis.com/k0rdent-enterprise}"
@@ -3417,6 +3422,88 @@ cmd_deploy_kof() {
         }
     ' runtime.yaml
 
+    # Retime + raise the severity of the node-down alerts (always-on, every deploy).
+    # KubeNodeNotReady / KubeNodeUnreachable default to for=15m, severity=warning. A
+    # downed node is high-signal and should be known fast, so drop the dwell to 5m and
+    # raise severity to critical (so it routes as critical to whatever receiver the
+    # operator wires — see KOF-ON-MKE4.md §7.8). Both fields are dig-templated from
+    # .Values.customRules in the kof-mothership chart's
+    # templates/prometheus/rules/kubernetes-system-kubelet.yaml:
+    #   for:      {{ dig "KubeNodeNotReady" "for" "15m" .Values.customRules }}
+    #   severity: {{ dig "KubeNodeNotReady" "severity" "warning" .Values.customRules }}
+    # so customRules.<AlertName>.{for,severity} is the surgical override (no group key,
+    # no expr redefinition). This is a general sensitivity preference, not reuse-specific,
+    # so it lives here (always-on), not in the reuse block below.
+    #
+    # Also remap Watchdog's severity none -> informational (also dig-templated:
+    # severity: {{ dig "Watchdog" "severity" "none" .Values.customRules }} in
+    # general.rules.yaml). Watchdog is the always-firing heartbeat; sf-notifier files its
+    # Salesforce ticket priority from STATE_MAP[severity.upper()], and "none" isn't a key
+    # -> "070 Unknown". "informational" maps to "060 Informational" (NOTE: the key is
+    # INFORMATIONAL, not INFO — "info" would also fall to 070 Unknown). Harmless without
+    # sf-notifier (just a cosmetic label); does not affect routing (Watchdog routes by
+    # alertname, §7.8) or InfoInhibitor (which targets severity=info, not informational).
+    yq -i '
+        .["kof-mothership"].values.customRules.KubeNodeNotReady.for = "5m"
+      | .["kof-mothership"].values.customRules.KubeNodeNotReady.severity = "critical"
+      | .["kof-mothership"].values.customRules.KubeNodeUnreachable.for = "5m"
+      | .["kof-mothership"].values.customRules.KubeNodeUnreachable.severity = "critical"
+      | .["kof-mothership"].values.customRules.Watchdog.severity = "informational"
+    ' runtime.yaml
+
+    # Salesforce alert routing (opt-in: kof_sf_notifier_enabled). Sets the mothership
+    # VMAlertmanager's configRawYaml so two kinds of alerts reach the sf-notifier webhook
+    # (http://sf-notifier:5000/hook): (1) anything with severity critical|warning|error,
+    # and (2) the always-firing Watchdog — sf-notifier/Salesforce treats Watchdog as a
+    # DEAD-MAN'S-SWITCH (if it stops arriving, monitoring is presumed down), so it must be
+    # delivered even though its severity is "none". Watchdog needs its own route (matchers
+    # within one route are AND-ed, and its severity is none, so it can't share the severity
+    # route). Everything else (other info/none, e.g. InfoInhibitor) falls through to a
+    # blackhole sink. send_resolved lets sf-notifier CLOSE the Salesforce ticket on resolve.
+    # sf-notifier itself is NOT deployed here — it's a customer-provided chart/image
+    # installed by hand (see KOF-ON-MKE4.md §7.8); this only wires the route. Default off,
+    # because routing to a missing sf-notifier makes Alertmanager log failed deliveries and
+    # fire AlertmanagerFailedToSendAlerts. configRawYaml must be a literal block, so we set
+    # it from an env var and force yq's literal style (same as the registry caData handling).
+    if [[ "${kof_sf_notifier_enabled}" == "true" ]]; then
+        info "Wiring Alertmanager Salesforce route (severity critical|warning|error + Watchdog -> sf-notifier:5000/hook)..."
+        local sf_alertmanager_config
+        sf_alertmanager_config="$(cat <<'YAML'
+global:
+  resolve_timeout: 5m
+route:
+  receiver: blackhole
+  group_by: [alertname, promxyCluster, namespace]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+  routes:
+    - receiver: Salesforce
+      matchers:
+        - severity=~"critical|warning|error"
+      continue: false
+    - receiver: Salesforce
+      matchers:
+        - alertname="Watchdog"
+      continue: false
+receivers:
+  - name: blackhole
+  - name: Salesforce
+    webhook_configs:
+      - send_resolved: true
+        http_config:
+          follow_redirects: true
+          enable_http2: true
+        url: 'http://sf-notifier:5000/hook'
+        max_alerts: 0
+YAML
+)"
+        SF_AM_CFG="${sf_alertmanager_config}" yq -i '
+            .["kof-mothership"].values.victoriametrics.vmalert.manager.spec.configRawYaml = strenv(SF_AM_CFG)
+          | .["kof-mothership"].values.victoriametrics.vmalert.manager.spec.configRawYaml style="literal"
+        ' runtime.yaml
+    fi
+
     # Grafana (on by default in both modes): turn on the grafana-operator + the
     # mothership's Grafana datasources/dashboards/admin-secret. The Grafana
     # *instance* itself is applied separately after install (kof_install_grafana) —
@@ -3490,6 +3577,40 @@ cmd_deploy_kof() {
                 "--custom-resource-state-config-file=/etc/config/crd-metrics-config.yaml",
                 "--custom-resource-state-only"
             ]
+        ' runtime.yaml
+
+        # Fix etcdMembersDown for reuse-mode scrape topology.
+        # The upstream rule (kube-prometheus etcd mixin) is:
+        #   max without(endpoint) (
+        #     sum without(instance,pod)(up{job=~".*etcd.*"} == bool 0)          <- clause 1
+        #     or
+        #     count without(To)(sum without(instance,pod)(rate(etcd_network_peer_sent_failures_total[2m])) > 0.01)  <- clause 2
+        #   ) > 0
+        # RCA (verified live, 3-CP, stop k0s on a controller): clause 1 is ALWAYS a
+        # value-0 series (the surviving members), with labels
+        # {job,cluster,clusterNamespace,promxyCluster,promxyClusterNamespace}. clause 2's
+        # direct-scrape series carries the SAME labels, so PromQL `or` (left wins on a
+        # label match) MASKS it -> max(...)>0 is false -> never fires. In a NON-reuse
+        # (full) deploy the alert only fires by accident: the k0s-pushgateway re-export of
+        # etcd_network_peer_sent_failures_total carries extra provenance labels
+        # (container/namespace/service/exported_job/exported_instance) that survive the
+        # sum/count and make clause 2's pushgateway copy a DIFFERENT series that escapes the
+        # mask. Our reuse-mode pushgateway dedup (kof_apply_k0s_pushgateway_dedup, drops
+        # exported_job=etcd) removes that escaping copy -> only the maskable direct-scrape
+        # copy remains -> the alert can never fire. (The dead member's own up goes ABSENT,
+        # not 0, because its on-node collector dies with the node, so clause 1 can't fire
+        # directly either.)
+        # FIX: append `> 0` to clause 1 so it is EMPTY when healthy instead of a masking 0,
+        # letting clause 2's clean direct-scrape peer-failure series (verified present and
+        # sustained on node loss) survive the `or` and fire. Override by same name via the
+        # chart's defaultAlertRules surface (Mirantis kof-alerts docs); also drop `for` to
+        # 5m (etcd member down is a quorum-risk condition worth knowing about fast, matching
+        # the node-down alerts, and the peer-failure signal is steady from the moment the
+        # member drops).
+        local etcd_members_down_expr='max without(endpoint) ((sum without(instance, pod) (up{job=~".*etcd.*"} == bool 0) > 0) or count without(To) (sum without(instance, pod) (rate(etcd_network_peer_sent_failures_total{job=~".*etcd.*"}[2m])) > 0.01)) > 0'
+        EMD_EXPR="${etcd_members_down_expr}" yq -i '
+            .["kof-mothership"].values.defaultAlertRules.etcd.etcdMembersDown.expr = strenv(EMD_EXPR)
+          | .["kof-mothership"].values.defaultAlertRules.etcd.etcdMembersDown.for = "5m"
         ' runtime.yaml
     fi
 

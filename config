@@ -77,6 +77,13 @@ kof_reuse_mke_monitoring=false
 # Without this, pod CPU/memory on sum-by-pod dashboards over-report ~2x. On by
 # default; set false to keep KOF's richer cAdvisor series set (accepting the 2x).
 kof_reuse_mke_kubelet=true
+# Wire the Alertmanager Salesforce route: alerts with severity critical|warning|error
+# are routed to the sf-notifier webhook (http://sf-notifier:5000/hook); info/none drop.
+# You still deploy sf-notifier itself by hand (see kof/KOF-ON-MKE4.md §7.8) — this only
+# adds the routing. Leave false unless sf-notifier is deployed: pointing the route at a
+# missing sf-notifier makes Alertmanager log failed deliveries and fire
+# AlertmanagerFailedToSendAlerts. Default off.
+kof_sf_notifier_enabled=false
 
 # ============================================================
 #  2. Airgap settings   (only for 't deploy lab airgap' / 'mke3-airgap')
