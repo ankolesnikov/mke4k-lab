@@ -57,6 +57,11 @@ t deploy registry mke3         # Setup MSR4 (Harbor) + upload MKE3 images
 t deploy cluster mke3-airgap   # DNS + proxy + launchpad from bastion
 t destroy cluster mke3-airgap  # launchpad reset from bastion
 
+# KOF observability (requires MKE 4.2.0+; kof_enabled=true auto-runs it in lab deploys)
+t deploy kof [full|lean]        # Deploy KOF on an existing cluster (online)
+t deploy kof [full|lean] airgap # Deploy KOF from the bastion (charts/images from internal registry)
+t destroy kof                   # helm uninstall + delete ns kof (auto-detects airgap)
+
 # Common
 t status                  # kubectl get nodes
 t show nodes              # Print IPs + NLB DNS
@@ -68,6 +73,7 @@ t tunnel                  # Show available tunnels with manual SSH commands
 t tunnel dashboard        # MKE4k Dashboard → https://localhost:3000
 t tunnel mke3             # MKE3 Dashboard  → https://localhost:3000
 t tunnel registry         # Harbor Registry  → https://localhost:8443
+t tunnel grafana          # KOF Grafana      → https://localhost:8443 (shares the 8443 -p mapping)
 ```
 
 ## Usage (Local)

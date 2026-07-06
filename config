@@ -56,8 +56,11 @@ msr4_version="4.13.3"
 #   2+   -> HA mode: external postgres-operator + redis-operator (requires NFS StorageClass)
 msr4_replicas=1
 
-# -- KOF observability (t deploy kof) --
+# -- KOF observability (t deploy kof / t deploy kof airgap) --
 # WARNING: requires MKE 4.2.0+ (k0rdent Enterprise 1.3.2). Keep false on MKE < 4.2.0.
+# Airgap is supported: the MKE 4.2.0 offline bundle ships all KOF charts/images;
+# 't deploy lab airgap' + kof_enabled=true (or 't deploy kof airgap' later) installs
+# from the bastion against the internal registry. Grafana access: t tunnel grafana.
 kof_enabled=false
 # Deployment scope: full | lean
 #   full = complete observability + FinOps platform
@@ -154,13 +157,17 @@ msr4_storage_size="10Gi"
 kof_version="1.8.1"
 # PVC size for VictoriaMetrics / VictoriaLogs / VictoriaTraces (doc default 100Gi).
 kof_storage_size="10Gi"
-# Image/chart registry. Override for airgap; leave default for online.
+# Image/chart registry. Leave default: in airgap it is auto-derived to
+# <registry_hostname>/mke (where the MKE bundle upload lands the KOF artifacts).
+# Override only to point at a different custom registry.
 kof_registry="registry.mirantis.com/k0rdent-enterprise"
 # Grafana image tag in <kof_registry>/grafana/grafana (registry ships 11.0.0).
 kof_grafana_image_tag="11.0.0"
-# Grafana gateway NodePort (MKE4k range 32768-35535).
+# Grafana gateway NodePort (MKE4k range 32768-35535). In airgap the gateway is
+# auto-enabled (only path to Grafana) and reached via: t tunnel grafana.
 kof_grafana_nodeport=33002
 # NLB listener port for Grafana (TCP pass-through; gateway terminates TLS).
+# In airgap this is the LOCAL port of 't tunnel grafana' (https://localhost:<port>).
 kof_grafana_lb_port=8443
 # Namespace where k0rdent (KCM) runs (MKE4k uses "k0rdent", upstream default "kcm-system").
 kof_kcm_namespace="k0rdent"

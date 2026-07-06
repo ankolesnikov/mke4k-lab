@@ -2470,6 +2470,20 @@ print_airgap_deploy_summary() {
         bline "$(printf '    w%-3s %s' "${i}" "${ip}")"
         (( i++ )) || true
     done
+    if [[ "${kof_enabled:-false}" == "true" ]]; then
+        sep
+        bline "  KOF (observability / M2M, mode=${kof_mode:-full})"
+        if [[ "${kof_grafana_enabled:-false}" == "true" ]]; then
+            bline "    Grafana: t tunnel grafana"
+            bline "      -> https://localhost:${kof_grafana_lb_port} (self-signed)"
+        else
+            bline "    Grafana: not enabled (kof_grafana_enabled)"
+        fi
+        if [[ "${kof_reuse_mke_monitoring:-false}" == "true" ]]; then
+            bline "    Reusing MKE monitoring (no KOF node-exporter)"
+            bline "    + MKE Prometheus datasource in Grafana"
+        fi
+    fi
     printf "╚%s╝\n" "${SEP}"
 
     echo ""
@@ -2478,6 +2492,9 @@ print_airgap_deploy_summary() {
     echo -e "  ${BOLD}SSH:${RESET}       t connect bastion      (direct)"
     echo -e "             t connect m1           (via bastion ProxyJump)"
     echo -e "  ${BOLD}Tunnels:${RESET}   t tunnel dashboard     → https://localhost:3000"
+    if [[ "${kof_enabled:-false}" == "true" && "${kof_grafana_enabled:-false}" == "true" ]]; then
+        echo -e "             t tunnel grafana       → https://localhost:${kof_grafana_lb_port}"
+    fi
     echo -e "             t tunnel               (show all + manual commands)"
     echo ""
 }
@@ -2715,6 +2732,10 @@ cmd_deploy_lab_airgap() {
         timer_phase_end _T_NFS
     fi
 
+    if [[ "${kof_enabled}" == "true" ]]; then
+        cmd_deploy_kof    # auto-detects the bastion → runs from there
+    fi
+
     if [[ "${k0rdent_ui_enabled}" == "true" ]]; then
         cmd_deploy_k0rdent_ui
     fi
@@ -2882,7 +2903,7 @@ cmd_deploy_nfs() {
 }
 
 # ---------------------------------------------------------------------------
-# KOF (k0rdent Observability & FinOps) — online self-monitoring (M2M) mode
+# KOF (k0rdent Observability & FinOps) — self-monitoring (M2M) mode
 # ---------------------------------------------------------------------------
 # Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (MKE 4.2.0).
 # M2M (Management-to-Management): the cluster stores its own metrics/logs/traces
@@ -2892,16 +2913,187 @@ cmd_deploy_nfs() {
 # KOF is a FluxCD-sequenced OCI umbrella Helm chart; installed with helm v3
 # (helm v4 has a webhook bug, kof issue #715 — the container ships helm v3).
 # Depends on a StorageClass (the 'nfs' add-on provides default 'nfs-client').
+#
+# Airgap: the MKE 4.2.0 offline bundle ships every KOF 1.8.1 chart and image;
+# upload_mke4k_bundle lands them at <registry>/mke/... (charts at
+# oci://<registry>/mke/charts/kof*). helm/kubectl/mkectl then run on the bastion
+# (the cluster API is private-subnet-only); all values-file generation stays
+# local. Values files and patch files travel by scp — never inline through ssh
+# (OTTL literals like ${env:OTEL_K8S_NODE_NAME} would be corrupted by shell
+# expansion). Per the k0rdent Enterprise airgap docs, no helmRepo secretRef /
+# certSecretRef is needed: the 'mke' Harbor project is public and the cluster
+# already trusts the registry CA (established by the MKE airgap install itself).
 # ---------------------------------------------------------------------------
+
+# KOF remoting state — set once by cmd_deploy_kof / cmd_destroy_kof. The online
+# defaults keep every kof_* helper callable standalone (mode=online → local exec).
+_kof_mode="online"        # online | airgap
+_kof_ssh_key=""
+_kof_bastion_ip=""
+
+# Run one complete cluster-touching shell-command string: locally (online) or on
+# the bastion with the cluster kubeconfig (airgap). The string is shell-parsed
+# exactly once in both modes (bash -c locally, the remote shell via ssh), so a
+# call that works online works identically in airgap. stdin is closed so calls
+# inside `while read` loops can't be drained by ssh.
+_kof_kexec() {
+    _msr_kexec "${_kof_mode}" "${_kof_ssh_key}" "${_kof_bastion_ip}" "$@" </dev/null
+}
+
+# kubectl apply a LOCAL file: online directly; airgap scp to the bastion first.
+# Usage: _kof_kapply <local-file> [kubectl apply args, e.g. -n kof]
+_kof_kapply() {
+    local f="$1"; shift
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        local rf="/tmp/$(basename "${f}")"
+        scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
+            "${f}" "ubuntu@${_kof_bastion_ip}:${rf}"
+        _kof_kexec "kubectl apply $* -f '${rf}' && rm -f '${rf}'"
+    else
+        kubectl apply "$@" -f "${f}"
+    fi
+}
+
+# kubectl patch with a LOCAL --patch-file (patch has no stdin form; the patch
+# bytes must never ride an interpolated ssh command line — see section header).
+# Usage: _kof_kpatch_file <local-patch-file> <kubectl args before --patch-file>
+#   e.g. _kof_kpatch_file "${pf}" -n kof patch opentelemetrycollector "${cr}" --type=merge
+_kof_kpatch_file() {
+    local f="$1"; shift
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        local rf="/tmp/$(basename "${f}")"
+        scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
+            "${f}" "ubuntu@${_kof_bastion_ip}:${rf}"
+        _kof_kexec "kubectl $* --patch-file='${rf}' && rm -f '${rf}'"
+    else
+        kubectl "$@" --patch-file="${f}"
+    fi
+}
+
+# One-time bastion prep for a KOF airgap deploy (idempotent, no-op online):
+# kubeconfig + registry DNS sanity, registry CA into the system trust store (so
+# helm's OCI pull validates TLS — same idiom as upload_msr4_artifacts), helm v3
+# if missing, then a chart presence check so a missing/partial bundle upload
+# fails fast with a clear message instead of mid-install.
+kof_bastion_prep() {
+    [[ "${_kof_mode}" == "airgap" ]] || return 0
+    info "Preparing bastion for KOF (helm, registry CA trust, chart check)..."
+    ssh_node "${_kof_ssh_key}" "${_kof_bastion_ip}" "
+        set -euo pipefail
+        [[ -f ~/.mke/mke.kubeconf ]] \
+            || { echo 'ERROR: ~/.mke/mke.kubeconf not found on bastion — deploy the cluster first.'; exit 1; }
+        grep -q '${registry_hostname}' /etc/hosts \
+            || { echo 'ERROR: ${registry_hostname} missing from bastion /etc/hosts — run t deploy registry first.'; exit 1; }
+        if [[ ! -f /usr/local/share/ca-certificates/msr-registry-ca.crt ]]; then
+            sudo cp ~/msr/certs/ca.crt /usr/local/share/ca-certificates/msr-registry-ca.crt
+            sudo update-ca-certificates >/dev/null
+        fi
+        if ! command -v helm >/dev/null 2>&1; then
+            echo '>>> Installing helm on bastion...'
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        fi
+        command -v kubectl >/dev/null 2>&1 && command -v mkectl >/dev/null 2>&1 \
+            || { echo 'ERROR: kubectl/mkectl missing on bastion — run t deploy lab airgap (or ensure_mkectl_on_bastion).'; exit 1; }
+    " || die "Bastion prep for KOF failed."
+    _kof_kexec "helm show chart 'oci://${kof_registry}/charts/kof' --version '${kof_version}' >/dev/null 2>&1" \
+        || die "KOF chart not found at oci://${kof_registry}/charts/kof:${kof_version} — is the MKE ${mke4k_version} bundle uploaded to the registry? (t deploy registry)"
+    return 0
+}
+
+# Flux's source-controller pulls the KOF sub-charts (HelmChart objects created by
+# the umbrella) and validates registry TLS PER HelmRepository via certSecretRef —
+# it does NOT inherit the caData trust that mke4.yaml distributes to MKE's own
+# components. Per the k0rdent Enterprise airgap docs, create a secret holding the
+# registry CA in the KCM namespace (where the umbrella's HelmRepositories live)
+# and reference it from global.helmRepo.spec + every *-service-template/istio
+# repo.spec (done in cmd_deploy_kof). The 'mke' project is public, so only the
+# cert is needed — no secretRef/credentials. Airgap-only, idempotent.
+kof_ensure_registry_cert_secret() {
+    [[ "${_kof_mode}" == "airgap" ]] || return 0
+    info "Ensuring registry CA secret 'kof-registry-cert' in ns ${kof_kcm_namespace} (Flux chart-pull TLS)..."
+    _kof_kexec "kubectl -n '${kof_kcm_namespace}' create secret generic kof-registry-cert \
+        --from-file=ca.crt=/home/ubuntu/msr/certs/ca.crt \
+        --dry-run=client -o yaml | kubectl apply -f -" \
+        || die "Failed to create the kof-registry-cert secret in ns ${kof_kcm_namespace}."
+    return 0
+}
+
+# Grafana is bring-your-own in KOF (Mirantis does not ship it with MKE), so the
+# grafana image is NOT in the offline bundle — and its VictoriaMetrics datasource
+# plugins are worse: GF_INSTALL_PLUGINS makes the pod download them from
+# grafana.com AT STARTUP, impossible from the private subnet (and the chart's
+# datasources are of type victoriametrics-*-datasource, so the plugins are not
+# optional). Fix both on the bastion (which has internet + docker + Harbor):
+# build a derived image with the plugins baked in and push it to the internal
+# registry as <tag>-airgap. Plugins are installed to /opt/grafana-plugins with
+# GF_PATHS_PLUGINS pointing there — NOT the default /var/lib/grafana/plugins,
+# which the grafana-data PVC mounts over and would shadow. kof_install_grafana
+# then uses the -airgap tag and strips GF_INSTALL_PLUGINS from the CR.
+# Idempotent: skips the build when the tag is already in Harbor.
+kof_prepare_grafana_airgap() {
+    [[ "${_kof_mode}" == "airgap" && "${kof_grafana_enabled}" == "true" ]] || return 0
+
+    local registry_pass
+    registry_pass="$(grep '^password=' "${TERRAFORM_DIR}/registry_credentials.txt" 2>/dev/null | cut -d= -f2)"
+    [[ -n "${registry_pass}" ]] || die "Registry password not found in ${TERRAFORM_DIR}/registry_credentials.txt"
+
+    local upstream="registry.mirantis.com/k0rdent-enterprise/grafana/grafana:${kof_grafana_image_tag}"
+    local target="${registry_hostname}/mke/grafana/grafana:${kof_grafana_image_tag}-airgap"
+
+    # Plugin list from the committed CR ("id ver,id ver") -> one install command each.
+    local plugins entry install_cmds=""
+    plugins="$(yq '.spec.deployment.spec.template.spec.containers[] | select(.name == "grafana")
+        | .env[] | select(.name == "GF_INSTALL_PLUGINS") | .value' "${PROJECT_ROOT}/kof/grafana.yaml")"
+    while IFS= read -r entry; do
+        [[ -n "${entry}" ]] || continue
+        install_cmds+="    grafana cli --pluginsDir /opt/grafana-plugins plugins install ${entry} && \\"$'\n'
+    done < <(tr ',' '\n' <<< "${plugins}")
+    [[ -n "${install_cmds}" ]] || { info "No GF_INSTALL_PLUGINS in kof/grafana.yaml — skipping grafana image prep."; return 0; }
+
+    # Render the Dockerfile locally, ship it, build+push on the bastion.
+    local df
+    df="$(mktemp "${TMPDIR:-/tmp}/kof-grafana-XXXX.Dockerfile")"
+    cat > "${df}" <<EOF
+FROM ${upstream}
+USER root
+RUN mkdir -p /opt/grafana-plugins && \\
+${install_cmds}    chown -R 472:472 /opt/grafana-plugins
+ENV GF_PATHS_PLUGINS=/opt/grafana-plugins
+USER 472
+EOF
+
+    info "Preparing airgap Grafana image on bastion (${target})..."
+    scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
+        "${df}" "ubuntu@${_kof_bastion_ip}:/tmp/kof-grafana.Dockerfile"
+    rm -f "${df}"
+    ssh_node "${_kof_ssh_key}" "${_kof_bastion_ip}" "
+        set -euo pipefail
+        docker login '${registry_hostname}' -u admin -p '${registry_pass}' >/dev/null 2>&1
+        if docker manifest inspect '${target}' >/dev/null 2>&1; then
+            echo '>>> Airgap Grafana image already in Harbor — skipping build.'
+        else
+            echo '>>> Building Grafana image with baked-in VM plugins (pull + plugin download need internet)...'
+            mkdir -p ~/kof-grafana-build
+            mv /tmp/kof-grafana.Dockerfile ~/kof-grafana-build/Dockerfile
+            docker build -t '${target}' ~/kof-grafana-build
+            docker push '${target}'
+            echo '>>> Pushed ${target}'
+        fi
+        rm -f /tmp/kof-grafana.Dockerfile
+    " || die "Airgap Grafana image preparation failed on the bastion."
+    return 0
+}
 
 kof_preflight() {
     local tool
-    for tool in helm yq kubectl jq; do
+    local -a need_tools=(yq jq)
+    [[ "${_kof_mode}" == "online" ]] && need_tools+=(helm kubectl)
+    for tool in "${need_tools[@]}"; do
         command -v "${tool}" >/dev/null 2>&1 \
             || die "KOF requires '${tool}' in PATH."
     done
-    kubectl get nodes >/dev/null 2>&1 \
-        || die "Cluster not reachable via KUBECONFIG=${KUBECONFIG}. Deploy the cluster first."
+    _kof_kexec "kubectl get nodes >/dev/null 2>&1" \
+        || die "Cluster not reachable (mode=${_kof_mode}). Deploy the cluster first."
     [[ -f "${PROJECT_ROOT}/kof/global-values.yaml" ]] \
         || die "Missing committed asset ${PROJECT_ROOT}/kof/global-values.yaml."
     [[ -f "${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml" ]] \
@@ -2914,7 +3106,7 @@ kof_preflight() {
         [[ -f "${PROJECT_ROOT}/kof/grafana-gateway.yaml" ]] \
             || die "kof_grafana_gateway_enabled=true but missing committed asset ${PROJECT_ROOT}/kof/grafana-gateway.yaml."
     fi
-    kubectl get ns "${kof_kcm_namespace}" >/dev/null 2>&1 \
+    _kof_kexec "kubectl get ns '${kof_kcm_namespace}' >/dev/null 2>&1" \
         || die "k0rdent (KCM) namespace '${kof_kcm_namespace}' not found. Set kof_kcm_namespace in config to the namespace where k0rdent runs (check 'kubectl get ns')."
     # HA (cluster) storage is the only supported topology today; single-node
     # (vmsingle / single VictoriaLogs) is a future seam pending chart support.
@@ -2924,21 +3116,22 @@ kof_preflight() {
         [[ "${kof_grafana_enabled}" != "true" || -f "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml" ]] \
             || die "kof_reuse_mke_monitoring=true but missing committed asset ${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml."
         # Soft checks: the reuse depends on MKE's monitoring stack being present.
-        kubectl get ns mke >/dev/null 2>&1 \
+        _kof_kexec "kubectl get ns mke >/dev/null 2>&1" \
             || warn "kof_reuse_mke_monitoring=true but namespace 'mke' not found — MKE monitoring may be absent; node metrics could go missing."
-        kubectl get svc prometheus-operated -n mke >/dev/null 2>&1 \
+        _kof_kexec "kubectl get svc prometheus-operated -n mke >/dev/null 2>&1" \
             || warn "MKE Prometheus service 'prometheus-operated' not found in ns 'mke' — the MKE Prometheus datasource will not resolve."
     fi
 }
 
 # Echo a usable StorageClass: cluster default, else 'nfs-client', else die.
 kof_resolve_storageclass() {
+    # jsonpath hoisted into a single-quoted local: it contains no single quotes,
+    # so it can be safely re-wrapped in single quotes inside the kexec string.
+    local jp='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}'
     local sc
-    sc="$(kubectl get sc \
-        -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}' \
-        2>/dev/null | head -n1)"
+    sc="$(_kof_kexec "kubectl get sc -o jsonpath='${jp}' 2>/dev/null" | head -n1)"
     if [[ -z "${sc}" ]]; then
-        if kubectl get sc nfs-client >/dev/null 2>&1; then
+        if _kof_kexec "kubectl get sc nfs-client >/dev/null 2>&1"; then
             sc="nfs-client"
         else
             die "No default StorageClass and no 'nfs-client' found. Run 't deploy nfs' (or set nfs_enabled=true) first."
@@ -2968,7 +3161,7 @@ kof_prune_dashboards() {
     info "Lean: pruning dashboards (folders: [${folders:-none}]; names: [${names:-none}])..."
 
     local to_delete
-    to_delete="$(kubectl get grafanadashboard -n kof -o json 2>/dev/null \
+    to_delete="$(_kof_kexec "kubectl get grafanadashboard -n kof -o json 2>/dev/null" \
         | FOLDERS="${folders}" NAMES="${names}" jq -r '
             ($ENV.FOLDERS | split(",") | map(select(length > 0))) as $folders
           | ($ENV.NAMES   | split(",") | map(select(length > 0))) as $names
@@ -2986,7 +3179,7 @@ kof_prune_dashboards() {
     local count=0 d
     while IFS= read -r d; do
         [[ -n "${d}" ]] || continue
-        kubectl delete grafanadashboard -n kof "${d}" --ignore-not-found >/dev/null 2>&1 \
+        _kof_kexec "kubectl delete grafanadashboard -n kof '${d}' --ignore-not-found >/dev/null 2>&1" \
             && count=$((count + 1))
     done <<< "${to_delete}"
     success "Pruned ${count} Lean dashboard(s)."
@@ -3001,14 +3194,17 @@ kof_prune_dashboards() {
 # Idempotent: merges into any existing exemptions and only re-applies the
 # cluster config when the exemption is missing (mkectl apply is heavyweight).
 kof_exempt_ucpauthz() {
-    ensure_mkectl
+    # Airgap: mkectl runs on the bastion (it SSHes to the private-subnet nodes and
+    # is already installed there — verified by kof_bastion_prep); the yq edit of
+    # the fetched config stays local either way.
+    [[ "${_kof_mode}" == "online" ]] && ensure_mkectl
 
     local cfg ns_sa
     ns_sa="system:serviceaccount:kof:opentelemetry-operator"
     cfg="$(mktemp "${TMPDIR:-/tmp}/kof-ucpauthz-XXXX.yaml")"
 
     info "Checking MKE ucpauthz admission-policy exemptions..."
-    mkectl config get 2>/dev/null | sed -n '/^apiVersion:/,$p' > "${cfg}"
+    _kof_kexec "mkectl config get 2>/dev/null" | sed -n '/^apiVersion:/,$p' > "${cfg}"
     [[ -s "${cfg}" ]] || { rm -f "${cfg}"; die "mkectl config get returned empty output. Is the cluster up?"; }
 
     if NS_SA="${ns_sa}" yq -e '
@@ -3026,8 +3222,16 @@ kof_exempt_ucpauthz() {
 
         local debug_flag=""
         [[ "${debug:-false}" == "true" ]] && debug_flag="-l debug"
-        mkectl ${debug_flag} apply -f "${cfg}" \
-            --skip-helm-extensions-check --skip-cni-check --cni-check-timeout 1
+        if [[ "${_kof_mode}" == "airgap" ]]; then
+            local rcfg="/tmp/$(basename "${cfg}")"
+            scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
+                "${cfg}" "ubuntu@${_kof_bastion_ip}:${rcfg}"
+            _kof_kexec "mkectl ${debug_flag} apply -f '${rcfg}' \
+                --skip-helm-extensions-check --skip-cni-check --cni-check-timeout 1 && rm -f '${rcfg}'"
+        else
+            mkectl ${debug_flag} apply -f "${cfg}" \
+                --skip-helm-extensions-check --skip-cni-check --cni-check-timeout 1
+        fi
         success "ucpauthz exemption applied."
     fi
 
@@ -3040,22 +3244,32 @@ kof_exempt_ucpauthz() {
 # registry/tag so the operator doesn't try docker.io/grafana/grafana:<version>.
 # Must run after the chart install so the grafana-operator + CRDs exist.
 kof_install_grafana() {
-    local gf
+    local gf gf_img="${kof_registry}/grafana/grafana:${kof_grafana_image_tag}"
     gf="$(mktemp "${TMPDIR:-/tmp}/kof-grafana-XXXX.yaml")"
     cp "${PROJECT_ROOT}/kof/grafana.yaml" "${gf}"
-    GF_IMG="${kof_registry}/grafana/grafana:${kof_grafana_image_tag}" TAG="${kof_grafana_image_tag}" yq -i '
+
+    # Airgap: use the plugins-baked image built by kof_prepare_grafana_airgap and
+    # strip GF_INSTALL_PLUGINS (the entrypoint would try grafana.com and crash;
+    # the baked image serves the plugins from GF_PATHS_PLUGINS instead).
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        gf_img="${gf_img}-airgap"
+        yq -i 'del(.spec.deployment.spec.template.spec.containers[] | select(.name == "grafana")
+            | .env[] | select(.name == "GF_INSTALL_PLUGINS"))' "${gf}"
+    fi
+
+    GF_IMG="${gf_img}" TAG="${kof_grafana_image_tag}" yq -i '
         .spec.version = strenv(TAG)
       | (.spec.deployment.spec.template.spec.containers[] | select(.name == "grafana") | .image) = strenv(GF_IMG)
     ' "${gf}"
 
-    info "Applying Grafana instance (image ${kof_registry}/grafana/grafana:${kof_grafana_image_tag})..."
-    kubectl wait --for=condition=Established crd/grafanas.grafana.integreatly.org --timeout=5m || true
-    kubectl apply -n kof -f "${gf}"
+    info "Applying Grafana instance (image ${gf_img})..."
+    _kof_kexec "kubectl wait --for=condition=Established crd/grafanas.grafana.integreatly.org --timeout=5m" || true
+    _kof_kapply "${gf}" -n kof
     rm -f "${gf}"
 
     info "Waiting for Grafana instance to become ready..."
-    kubectl wait grafana grafana-vm -n kof \
-        --for=jsonpath='{.status.stageStatus}'=success --timeout=5m || true
+    _kof_kexec "kubectl wait grafana grafana-vm -n kof \
+        --for=jsonpath='{.status.stageStatus}'=success --timeout=5m" || true
     return 0
 }
 
@@ -3065,9 +3279,9 @@ kof_install_grafana() {
 # chart install so the GrafanaDatasource CRD + grafana-operator exist.
 kof_add_mke_datasource() {
     info "Adding MKE Prometheus as a Grafana datasource (prometheus-operated.mke:9090)..."
-    kubectl wait --for=condition=Established \
-        crd/grafanadatasources.grafana.integreatly.org --timeout=5m || true
-    kubectl apply -n kof -f "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml"
+    _kof_kexec "kubectl wait --for=condition=Established \
+        crd/grafanadatasources.grafana.integreatly.org --timeout=5m" || true
+    _kof_kapply "${PROJECT_ROOT}/kof/mke-prometheus-datasource.yaml" -n kof
     return 0
 }
 
@@ -3104,7 +3318,7 @@ kof_apply_node_label_transform() {
     local stmt_node='set(datapoint.attributes["node"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^(node_|machine_|container_|kubelet_)") and datapoint.attributes["node"] == nil'
     local stmt_nodename='set(datapoint.attributes["nodename"], "${env:OTEL_K8S_NODE_NAME}") where IsMatch(metric.name, "^(node_|machine_|container_|kubelet_)") and datapoint.attributes["nodename"] == nil'
 
-    kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
+    _kof_kexec "kubectl get opentelemetrycollector '${cr}' -n kof >/dev/null 2>&1" \
         || { warn "Collector ${cr} not found — skipping node-label transform."; return 0; }
 
     info "Adding node-label transform to ${cr} (reuse-MKE-monitoring node-exporter fix)..."
@@ -3113,7 +3327,7 @@ kof_apply_node_label_transform() {
     # just before "batch" (idempotent — no-op if already present), so we don't
     # clobber whatever processors the chart shipped.
     local cur_json new_json
-    cur_json="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+    cur_json="$(_kof_kexec "kubectl -n kof get opentelemetrycollector '${cr}' -o json 2>/dev/null" \
         | jq -c '.spec.config.service.pipelines.metrics.processors // []')"
     if [[ -z "${cur_json}" || "${cur_json}" == "null" ]]; then
         warn "Could not read ${cr} metrics pipeline — skipping node-label transform."
@@ -3131,12 +3345,12 @@ kof_apply_node_label_transform() {
             processors:{"transform/setnode":{metric_statements:[{context:"datapoint",statements:[$s1,$s2]}]}},
             service:{pipelines:{metrics:{processors:$procs}}}
         }}}' > "${patch_file}"
-    kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${patch_file}"
+    _kof_kpatch_file "${patch_file}" -n kof patch opentelemetrycollector "${cr}" --type=merge
     rm -f "${patch_file}"
 
     # Roll the collector so the operator regenerates its config, then wait it out.
-    kubectl -n kof rollout restart "ds/${ds}" >/dev/null 2>&1 || true
-    kubectl -n kof rollout status "ds/${ds}" --timeout=180s || true
+    _kof_kexec "kubectl -n kof rollout restart 'ds/${ds}' >/dev/null 2>&1" || true
+    _kof_kexec "kubectl -n kof rollout status 'ds/${ds}' --timeout=180s" || true
     success "Node-label transform applied to ${cr}."
     return 0
 }
@@ -3166,7 +3380,7 @@ kof_apply_node_label_transform() {
 kof_apply_k0s_pushgateway_dedup() {
     local cr="kof-collectors-ta-daemon" ds="kof-collectors-ta-daemon-collector"
 
-    kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 \
+    _kof_kexec "kubectl get opentelemetrycollector '${cr}' -n kof >/dev/null 2>&1" \
         || { warn "Collector ${cr} not found — skipping k0s-pushgateway dedup."; return 0; }
 
     info "Dropping k0s-pushgateway scheduler/controller-manager/etcd re-exports on ${cr}..."
@@ -3174,7 +3388,7 @@ kof_apply_k0s_pushgateway_dedup() {
     # Append filter/drop_k0s_pushgateway to the metrics pipeline (before batch,
     # idempotent) without clobbering transform/setnode or anything the chart ships.
     local cur_json new_json
-    cur_json="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+    cur_json="$(_kof_kexec "kubectl -n kof get opentelemetrycollector '${cr}' -o json 2>/dev/null" \
         | jq -c '.spec.config.service.pipelines.metrics.processors // []')"
     if [[ -z "${cur_json}" || "${cur_json}" == "null" ]]; then
         warn "Could not read ${cr} metrics pipeline — skipping k0s-pushgateway dedup."
@@ -3201,12 +3415,12 @@ kof_apply_k0s_pushgateway_dedup() {
             }},
             service:{pipelines:{metrics:{processors:$procs}}}
         }}}' > "${patch_file}"
-    kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${patch_file}"
+    _kof_kpatch_file "${patch_file}" -n kof patch opentelemetrycollector "${cr}" --type=merge
     rm -f "${patch_file}"
 
     # Roll the collector so the operator regenerates its config, then wait it out.
-    kubectl -n kof rollout restart "ds/${ds}" >/dev/null 2>&1 || true
-    kubectl -n kof rollout status "ds/${ds}" --timeout=180s || true
+    _kof_kexec "kubectl -n kof rollout restart 'ds/${ds}' >/dev/null 2>&1" || true
+    _kof_kexec "kubectl -n kof rollout status 'ds/${ds}' --timeout=180s" || true
     success "k0s-pushgateway dedup applied to ${cr}."
     return 0
 }
@@ -3229,8 +3443,8 @@ kof_apply_k0s_pushgateway_dedup() {
 kof_apply_kubelet_dedup() {
     local cr pf has rolled=0
     for cr in kof-collectors-daemon kof-collectors-controller-k0s-daemon; do
-        kubectl get opentelemetrycollector "${cr}" -n kof >/dev/null 2>&1 || continue
-        has="$(kubectl -n kof get opentelemetrycollector "${cr}" -o json 2>/dev/null \
+        _kof_kexec "kubectl get opentelemetrycollector '${cr}' -n kof >/dev/null 2>&1" || continue
+        has="$(_kof_kexec "kubectl -n kof get opentelemetrycollector '${cr}' -o json 2>/dev/null" \
             | jq -r '[.spec.config.receivers.prometheus.config.scrape_configs[]?.job_name
                       | select(startswith("kubelet"))] | length')"
         if [[ -z "${has}" || "${has}" == "0" ]]; then
@@ -3239,14 +3453,14 @@ kof_apply_kubelet_dedup() {
         fi
         info "  ${cr}: dropping ${has} kubelet* scrape job(s) (reuse-MKE kubelet dedup)..."
         pf="$(mktemp "${TMPDIR:-/tmp}/kof-nokubelet-XXXX.json")"
-        kubectl -n kof get opentelemetrycollector "${cr}" -o json \
+        _kof_kexec "kubectl -n kof get opentelemetrycollector '${cr}' -o json" \
             | jq '.spec.config.receivers.prometheus.config.scrape_configs
                   |= map(select(.job_name | startswith("kubelet") | not))
                 | {spec:{config:{receivers:{prometheus:{config:{scrape_configs:
                     .spec.config.receivers.prometheus.config.scrape_configs}}}}}}' > "${pf}"
-        kubectl -n kof patch opentelemetrycollector "${cr}" --type=merge --patch-file="${pf}"
+        _kof_kpatch_file "${pf}" -n kof patch opentelemetrycollector "${cr}" --type=merge
         rm -f "${pf}"
-        kubectl -n kof rollout restart "ds/${cr}-collector" >/dev/null 2>&1 || true
+        _kof_kexec "kubectl -n kof rollout restart 'ds/${cr}-collector' >/dev/null 2>&1" || true
         rolled=1
     done
     [[ "${rolled}" == "1" ]] && success "Kubelet dedup applied (MKE's kubelet ServiceMonitor is now the single source)."
@@ -3259,9 +3473,17 @@ kof_apply_kubelet_dedup() {
 kof_install_grafana_gateway() {
     local output lb_dns
     output="$(tf_output 2>/dev/null)" || die "Could not read terraform output for the Grafana gateway."
-    lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty')"
+    # SANs: NLB DNS + node public IPs online; private node IPs + 127.0.0.1 in
+    # airgap (access is `t tunnel grafana` → https://localhost, no NLB involved).
     local -a sans_ip=()
-    mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_ips.value // [])[], (.worker_ips.value // [])[]' 2>/dev/null)
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        lb_dns=""
+        mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_private_ips.value // [])[], (.worker_private_ips.value // [])[]' 2>/dev/null)
+        sans_ip+=("127.0.0.1")
+    else
+        lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty')"
+        mapfile -t sans_ip < <(echo "${output}" | jq -r '(.controller_ips.value // [])[], (.worker_ips.value // [])[]' 2>/dev/null)
+    fi
 
     local gw
     gw="$(mktemp "${TMPDIR:-/tmp}/kof-gw-XXXX.yaml")"
@@ -3271,6 +3493,26 @@ kof_install_grafana_gateway() {
         (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyService.patch.value.spec.ports[0].nodePort)
         = (strenv(NP) | tonumber)
     ' "${gw}"
+
+    # Airgap: pin the Envoy data-plane image. Our EnvoyProxy CR doesn't set one,
+    # so MKE's Envoy Gateway controller falls back to its compiled-in default
+    # (docker.io/envoyproxy/envoy:...) — unpullable from the private subnet.
+    # MKE's own gateways pin the internal-registry image in their EnvoyProxy CRs;
+    # reuse the exact image ref from MKE's running envoy pod (right registry AND
+    # tag, auto-tracks MKE versions), falling back to the bundle's known path.
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        local envoy_img
+        envoy_img="$(_kof_kexec "kubectl get pods -n mke -l app.kubernetes.io/name=envoy \
+            -o jsonpath='{.items[0].spec.containers[?(@.name==\"envoy\")].image}' 2>/dev/null" || true)"
+        if [[ -z "${envoy_img}" ]]; then
+            envoy_img="${kof_registry}/envoyproxy/envoy:distroless-v1.37.3"
+            warn "Could not discover MKE's envoy data-plane image — falling back to ${envoy_img}."
+        fi
+        info "Pinning Envoy data-plane image to ${envoy_img} (airgap)."
+        EIMG="${envoy_img}" yq -i '
+            (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyDeployment.container.image) = strenv(EIMG)
+        ' "${gw}"
+    fi
 
     # Cert SANs: NLB DNS + node public IPs (fall back to a placeholder if neither).
     yq -i '(select(.kind == "Certificate").spec.dnsNames) = [] | (select(.kind == "Certificate").spec.ipAddresses) = []' "${gw}"
@@ -3284,16 +3526,49 @@ kof_install_grafana_gateway() {
     fi
 
     info "Applying Grafana Envoy gateway (NodePort ${kof_grafana_nodeport}, NLB :${kof_grafana_lb_port})..."
-    kubectl apply -f "${gw}"
+    _kof_kapply "${gw}"
     rm -f "${gw}"
 
-    kubectl wait --for=condition=Ready certificate/kof-grafana -n kof --timeout=2m || true
-    kubectl wait --for=condition=Programmed gateway/kof-grafana -n kof --timeout=3m || true
+    _kof_kexec "kubectl wait --for=condition=Ready certificate/kof-grafana -n kof --timeout=2m" || true
+    _kof_kexec "kubectl wait --for=condition=Programmed gateway/kof-grafana -n kof --timeout=3m" || true
+    return 0
+}
+
+# Install the KOF umbrella chart from the generated values files in the CURRENT
+# directory (cmd_deploy_kof's workdir). Online: helm runs locally, byte-identical
+# to the original inline invocation. Airgap: the three values files are scp'd to
+# the bastion and helm runs there (kof_bastion_prep guaranteed helm + CA trust;
+# the 'mke' Harbor project is public so the OCI pull needs no login).
+kof_helm_install() {
+    info "Installing KOF umbrella chart (mode=${kof_mode}, helm v3, FluxCD-sequenced)..."
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        local rdir="/tmp/$(basename "$(pwd)")"    # kof-XXXX — unique per run
+        ssh_node "${_kof_ssh_key}" "${_kof_bastion_ip}" "mkdir -p '${rdir}'"
+        scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
+            global-components.yaml profile.yaml runtime.yaml \
+            "ubuntu@${_kof_bastion_ip}:${rdir}/"
+        _kof_kexec "cd '${rdir}' && helm upgrade -i --reset-values --wait \
+            --create-namespace -n kof kof \
+            'oci://${kof_registry}/charts/kof' \
+            --version '${kof_version}' \
+            -f global-components.yaml \
+            -f profile.yaml \
+            -f runtime.yaml \
+            && cd / && rm -rf '${rdir}'"
+    else
+        helm upgrade -i --reset-values --wait \
+            --create-namespace -n kof kof \
+            "oci://${kof_registry}/charts/kof" \
+            --version "${kof_version}" \
+            -f global-components.yaml \
+            -f profile.yaml \
+            -f runtime.yaml
+    fi
     return 0
 }
 
 cmd_deploy_kof() {
-    local mode_arg="${1:-}"
+    local mode_arg="${1:-}" airgap_arg="${2:-}"
     load_config
 
     # Resolve deployment mode: CLI positional overrides config (kof_mode).
@@ -3305,20 +3580,65 @@ cmd_deploy_kof() {
         *) die "Unknown KOF mode '${mode}'. Try: full, lean." ;;
     esac
 
+    # Resolve online vs airgap: the airgap topology is a property of the deployed
+    # lab (bastion present), so auto-detect from terraform output — the explicit
+    # `t deploy kof ... airgap` token just asserts it (die on mismatch).
+    local output bastion_ip
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        _kof_mode="airgap"
+        _kof_bastion_ip="${bastion_ip}"
+        _kof_ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+        [[ -z "${airgap_arg}" ]] && info "Airgap lab detected (bastion ${bastion_ip}) — deploying KOF from the bastion."
+    else
+        [[ "${airgap_arg}" == "airgap" ]] \
+            && die "'t deploy kof ... airgap' requested but no bastion found — deploy the airgap lab first (t deploy lab airgap)."
+        _kof_mode="online"
+    fi
+
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        # Point KOF at the internal registry: the MKE bundle upload lands every
+        # KOF chart/image under <registry>/mke/ (charts at .../mke/charts/kof*).
+        # Only auto-derive when the config still holds the upstream default so a
+        # deliberate kof_registry override wins.
+        if [[ "${kof_registry}" == "registry.mirantis.com/k0rdent-enterprise" ]]; then
+            kof_registry="${registry_hostname}/mke"
+        fi
+        if [[ "${kof_sf_notifier_enabled}" == "true" ]]; then
+            warn "kof_sf_notifier_enabled=true in airgap: the private subnet has no internet, so sf-notifier cannot reach Salesforce."
+            warn "The Alertmanager route will be wired anyway; expect AlertmanagerFailedToSendAlerts unless sf-notifier has a working egress path."
+        fi
+        kof_bastion_prep
+    fi
+
     kof_preflight
+    kof_ensure_registry_cert_secret
+    kof_prepare_grafana_airgap
 
     local sc
     sc="$(kof_resolve_storageclass)"
-    info "KOF deploy: mode=${kof_mode} version=${kof_version} storageClass=${sc} kcmNamespace=${kof_kcm_namespace} registry=${kof_registry}"
+    info "KOF deploy: mode=${kof_mode} exec=${_kof_mode} version=${kof_version} storageClass=${sc} kcmNamespace=${kof_kcm_namespace} registry=${kof_registry}"
 
     # Must run before the chart install so the operator can create collector
     # DaemonSets without being rejected by MKE's admission policy.
     kof_exempt_ucpauthz
 
-    # Grafana-over-gateway needs an NLB listener + SG NodePort rule (terraform).
-    # Reconcile infra here so standalone 't deploy kof' also gets them (idempotent
-    # — a no-op when 't deploy lab' already applied with the gateway enabled).
-    if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+    # Grafana access path. Online with the gateway toggle: the gateway needs an
+    # NLB listener + SG NodePort rule (terraform) — reconcile infra here so
+    # standalone 't deploy kof' also gets them (idempotent — a no-op when
+    # 't deploy lab' already applied with the gateway enabled). Airgap: the
+    # gateway is AUTO-ENABLED whenever Grafana is (it's the only way to reach
+    # Grafana — `t tunnel grafana` → bastion → NodePort ${kof_grafana_nodeport});
+    # no terraform needed (internal NLB is bypassed by the tunnel and the SG
+    # already opens the NodePort).
+    local effective_gateway="${kof_grafana_gateway_enabled}"
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        if [[ "${kof_grafana_enabled}" == "true" && "${effective_gateway}" != "true" ]]; then
+            info "Airgap: auto-enabling the Grafana gateway (required for 't tunnel grafana' access)."
+            effective_gateway="true"
+        fi
+    elif [[ "${effective_gateway}" == "true" ]]; then
         info "Ensuring NLB listener + SG NodePort for the Grafana gateway (terraform)..."
         write_tfvars false false
         tf_init
@@ -3338,6 +3658,25 @@ cmd_deploy_kof() {
     if [[ "${kof_registry}" != "registry.mirantis.com/k0rdent-enterprise" ]]; then
         info "Repointing KOF images to ${kof_registry}..."
         sed -i "s#registry.mirantis.com/k0rdent-enterprise#${kof_registry}#g" global-values.yaml
+    fi
+
+    # Airgap: hand the registry CA to every Flux HelmRepository the charts create
+    # (certSecretRef per the k0rdent Enterprise airgap docs — Flux does NOT share
+    # MKE's caData trust). Covers the umbrella's two HelmRepositories
+    # (global.helmRepo.spec is merged verbatim into both, incl. victoria-metrics,
+    # and kcm.kof.repo.name just points at the umbrella's 'oci-registry' one) and
+    # the kgst service-template / istio repos. The secret itself is created by
+    # kof_ensure_registry_cert_secret. Edited here in global-values.yaml so the
+    # components fan-out below propagates it everywhere, like the sed above.
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        yq -i '
+            .global.helmRepo.spec.certSecretRef.name = "kof-registry-cert"
+          | .["cert-manager-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
+          | .["envoy-gateway-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
+          | .["ingress-nginx-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
+          | .["k0rdent-istio"].repo.spec.certSecretRef.name = "kof-registry-cert"
+          | .istio.repo.spec.certSecretRef.name = "kof-registry-cert"
+        ' global-values.yaml
     fi
 
     # Shrink VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes for lab use.
@@ -3614,23 +3953,16 @@ YAML
         ' runtime.yaml
     fi
 
-    info "Installing KOF umbrella chart (mode=${kof_mode}, helm v3, FluxCD-sequenced)..."
-    helm upgrade -i --reset-values --wait \
-        --create-namespace -n kof kof \
-        "oci://${kof_registry}/charts/kof" \
-        --version "${kof_version}" \
-        -f global-components.yaml \
-        -f profile.yaml \
-        -f runtime.yaml
+    kof_helm_install
 
     info "Waiting for KOF HelmReleases to become Ready (Flux-driven)..."
-    kubectl wait --for=condition=Ready helmreleases --all -n kof --timeout=10m || true
-    kubectl get hr -n kof || true
-    kubectl get pod -n kof || true
+    _kof_kexec "kubectl wait --for=condition=Ready helmreleases --all -n kof --timeout=10m" || true
+    _kof_kexec "kubectl get hr -n kof" || true
+    _kof_kexec "kubectl get pod -n kof" || true
 
     if [[ "${kof_grafana_enabled}" == "true" ]]; then
         kof_install_grafana
-        if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+        if [[ "${effective_gateway}" == "true" ]]; then
             kof_install_grafana_gateway
         fi
         if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
@@ -3665,9 +3997,15 @@ YAML
     cd "${PROJECT_ROOT}"
     echo ""
     echo -e "  ${BOLD}KOF access (self-monitoring / M2M, mode=${kof_mode}):${RESET}"
-    echo -e "    List services:  kubectl get svc -n kof"
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        echo -e "    List services:  t connect m1 \"kubectl get svc -n kof\"  (or kubectl on the bastion)"
+    else
+        echo -e "    List services:  kubectl get svc -n kof"
+    fi
     if [[ "${kof_grafana_enabled}" == "true" ]]; then
-        if [[ "${kof_grafana_gateway_enabled}" == "true" ]]; then
+        if [[ "${_kof_mode}" == "airgap" ]]; then
+            echo -e "    Grafana (HTTPS): t tunnel grafana   → https://localhost:${kof_grafana_lb_port}  (self-signed; accept the cert)"
+        elif [[ "${effective_gateway}" == "true" ]]; then
             local _lb_dns
             _lb_dns="$(tf_output 2>/dev/null | jq -r '.lb_dns_name.value // empty' 2>/dev/null)"
             echo -e "    Grafana (HTTPS): https://${_lb_dns:-<nlb-dns>}:${kof_grafana_lb_port}  (self-signed; accept the cert)"
@@ -3677,8 +4015,8 @@ YAML
             echo -e "                    then open http://localhost:3000  (dashboards + metrics/logs/traces datasources)"
         fi
         local _gf_user _gf_pass
-        _gf_user="$(kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_USER}' 2>/dev/null | base64 -d 2>/dev/null)"
-        _gf_pass="$(kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null)"
+        _gf_user="$(_kof_kexec "kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_USER}' 2>/dev/null" | base64 -d 2>/dev/null)"
+        _gf_pass="$(_kof_kexec "kubectl get secret -n kof grafana-admin-credentials -o jsonpath='{.data.GF_SECURITY_ADMIN_PASSWORD}' 2>/dev/null" | base64 -d 2>/dev/null)"
         if [[ -n "${_gf_user}" && -n "${_gf_pass}" ]]; then
             echo -e "    Grafana login:  ${BOLD}${_gf_user}${RESET} / ${BOLD}${_gf_pass}${RESET}"
         else
@@ -3691,6 +4029,9 @@ YAML
     echo -e "                    then open http://localhost:9471/select/vmui/"
     echo -e "    Metrics (VMUI): kubectl -n kof port-forward svc/vmselect-cluster 8481:8481"
     echo -e "                    then open http://localhost:8481/select/0/vmui/"
+    if [[ "${_kof_mode}" == "airgap" ]]; then
+        echo -e "                    (airgap: run the port-forwards on the bastion — KUBECONFIG=~/.mke/mke.kubeconf)"
+    fi
     if [[ "${kof_reuse_mke_monitoring}" == "true" ]]; then
         echo -e "    MKE reuse:      KOF node-exporter disabled; node metrics scraped from MKE's (ns mke)"
         echo -e "                    'MKE Prometheus' datasource added to Grafana (prometheus-operated.mke:9090)"
@@ -3702,9 +4043,23 @@ YAML
 
 cmd_destroy_kof() {
     load_config
-    info "Removing KOF..."
-    helm uninstall kof -n kof || true
-    kubectl delete ns kof --wait=false || true
+
+    # Same airgap auto-detection as cmd_deploy_kof: with a bastion present, helm
+    # and kubectl only work from there.
+    local output bastion_ip
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        _kof_mode="airgap"
+        _kof_bastion_ip="${bastion_ip}"
+        _kof_ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    else
+        _kof_mode="online"
+    fi
+
+    info "Removing KOF (exec=${_kof_mode})..."
+    _kof_kexec "helm uninstall kof -n kof" || true
+    _kof_kexec "kubectl delete ns kof --wait=false" || true
     warn "If namespace 'kof' hangs in Terminating, PVCs/finalizers may need manual cleanup."
     success "KOF removed."
     return 0
@@ -3812,6 +4167,24 @@ k0rdent_ui_install_gateway() {
         (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyService.patch.value.spec.ports[0].nodePort)
         = (strenv(NP) | tonumber)
     ' "${gw}"
+
+    # Airgap: pin the Envoy data-plane image (same fix as the KOF Grafana gateway
+    # — an unpinned EnvoyProxy falls back to the controller's docker.io default,
+    # unpullable from the private subnet). Reuse MKE's own envoy pod image ref.
+    if [[ "${mode}" == "airgap" ]]; then
+        local envoy_img
+        envoy_img="$(_msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
+            "kubectl get pods -n mke -l app.kubernetes.io/name=envoy \
+            -o jsonpath='{.items[0].spec.containers[?(@.name==\"envoy\")].image}' 2>/dev/null" || true)"
+        if [[ -z "${envoy_img}" ]]; then
+            envoy_img="${registry_hostname}/mke/envoyproxy/envoy:distroless-v1.37.3"
+            warn "Could not discover MKE's envoy data-plane image — falling back to ${envoy_img}."
+        fi
+        info "Pinning Envoy data-plane image to ${envoy_img} (airgap)."
+        EIMG="${envoy_img}" yq -i '
+            (select(.kind == "EnvoyProxy").spec.provider.kubernetes.envoyDeployment.container.image) = strenv(EIMG)
+        ' "${gw}"
+    fi
 
     yq -i '(select(.kind == "Certificate").spec.dnsNames) = [] | (select(.kind == "Certificate").spec.ipAddresses) = []' "${gw}"
     [[ -n "${lb_dns}" ]] && D="${lb_dns}" yq -i '(select(.kind == "Certificate").spec.dnsNames) += [strenv(D)]' "${gw}"
@@ -5117,6 +5490,17 @@ cmd_tunnel() {
             ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
                 -L "0.0.0.0:${k0rdent_ui_lb_port}:${ctrl_priv_ip}:${k0rdent_ui_nodeport}" -N "ubuntu@${bastion_pub_ip}"
             ;;
+        grafana)
+            local ctrl_priv_ip
+            ctrl_priv_ip="$(echo "${output}" | jq -r '.controller_private_ips.value[0] // empty' 2>/dev/null)"
+            [[ -n "${ctrl_priv_ip}" && "${ctrl_priv_ip}" != "null" ]] \
+                || die "No controller private IP found. Is this an airgap cluster?"
+            info "Tunnelling KOF Grafana → https://localhost:${kof_grafana_lb_port}"
+            info "  (via bastion ${bastion_pub_ip} → controller ${ctrl_priv_ip}:${kof_grafana_nodeport})"
+            info "  Press Ctrl-C to stop."
+            ssh -o StrictHostKeyChecking=no -i "${ssh_key}" \
+                -L "0.0.0.0:${kof_grafana_lb_port}:${ctrl_priv_ip}:${kof_grafana_nodeport}" -N "ubuntu@${bastion_pub_ip}"
+            ;;
         "")
             echo ""
             echo -e "${BOLD}Available tunnels:${RESET}"
@@ -5125,6 +5509,7 @@ cmd_tunnel() {
             echo "  t tunnel mke3         MKE3 Dashboard  → https://localhost:3000"
             echo "  t tunnel msr4         MSR4 Harbor UI  → https://localhost:8444"
             echo "  t tunnel k0rdent-ui   k0rdent UI      → https://localhost:${k0rdent_ui_lb_port}"
+            echo "  t tunnel grafana      KOF Grafana     → https://localhost:${kof_grafana_lb_port}"
             echo ""
             echo -e "${BOLD}Harbor Registry (no tunnel needed — publicly accessible):${RESET}"
             echo "  https://${bastion_pub_ip}"
@@ -5150,6 +5535,11 @@ cmd_tunnel() {
                     echo "  ssh -i ${ssh_key} -L 0.0.0.0:${k0rdent_ui_lb_port}:${ctrl_priv_ip}:${k0rdent_ui_nodeport} -N ubuntu@${bastion_pub_ip}"
                     echo ""
                 fi
+                if [[ "${kof_enabled:-false}" == "true" ]]; then
+                    echo "  # KOF Grafana (via controller NodePort)"
+                    echo "  ssh -i ${ssh_key} -L 0.0.0.0:${kof_grafana_lb_port}:${ctrl_priv_ip}:${kof_grafana_nodeport} -N ubuntu@${bastion_pub_ip}"
+                    echo ""
+                fi
             fi
             echo "  # Kubernetes API (for local kubectl)"
             echo "  ssh -i ${ssh_key} -L 0.0.0.0:6443:${lb_dns}:6443 -N ubuntu@${bastion_pub_ip}"
@@ -5159,7 +5549,7 @@ cmd_tunnel() {
             fi
             ;;
         *)
-            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, msr4, k0rdent-ui, registry"
+            die "Unknown tunnel target: ${target}. Try: dashboard, mke3, msr4, k0rdent-ui, grafana, registry"
             ;;
     esac
 }
@@ -5258,6 +5648,7 @@ usage() {
     echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
     echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
     echo "  deploy kof [full|lean]      Deploy KOF observability/FinOps (self-monitoring; default kof_mode)"
+    echo "  deploy kof [full|lean] airgap  Deploy KOF from the bastion (charts/images from the internal registry)"
     echo "  deploy k0rdent-ui           Rotate the k0rdent UI password + publish it via Envoy gateway"
     echo "  destroy cluster             Uninstall MKE4k (mkectl reset)"
     echo "  destroy cluster mke3        Uninstall MKE3 (launchpad reset)"
@@ -5279,6 +5670,7 @@ usage() {
     echo "  tunnel mke3                 MKE3 Dashboard  → https://localhost:3000"
     echo "  tunnel msr4                 MSR4 Harbor UI  → https://localhost:8444"
     echo "  tunnel k0rdent-ui           k0rdent UI      → https://localhost:8445"
+    echo "  tunnel grafana              KOF Grafana     → https://localhost:8443"
     echo ""
     echo "Prerequisites:"
     echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
@@ -5339,9 +5731,16 @@ case "${COMMAND}" in
                 esac
                 ;;
             kof)
+                # t deploy kof [full|lean] [airgap]  |  t deploy kof airgap
                 case "${3:-}" in
-                    ""|full|lean) cmd_deploy_kof "${3:-}" ;;
-                    *)            die "Unknown variant: t deploy kof ${3}. Try: full, lean." ;;
+                    airgap)  cmd_deploy_kof "" airgap ;;
+                    ""|full|lean)
+                        case "${4:-}" in
+                            ""|airgap) cmd_deploy_kof "${3:-}" "${4:-}" ;;
+                            *)         die "Unknown variant: t deploy kof ${3} ${4}. Try: t deploy kof [full|lean] [airgap]" ;;
+                        esac
+                        ;;
+                    *)       die "Unknown variant: t deploy kof ${3}. Try: t deploy kof [full|lean] [airgap]" ;;
                 esac
                 ;;
             k0rdent-ui) cmd_deploy_k0rdent_ui ;;
