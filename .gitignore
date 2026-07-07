@@ -28,3 +28,5 @@ terraform/msr4_redis_password.txt
 kof/MKE4-INTEGRATION.md
 kof/INSTALL-MKE.md
 kof/KOF-RUNBOOK.md
+kof/KOF-ON-MKE4.md
+.markdownlint.json

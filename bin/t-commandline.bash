@@ -126,12 +126,12 @@ load_config() {
 
     # KOF defaults
     kof_enabled="${kof_enabled:-false}"
-    kof_mode="${kof_mode:-full}"
+    kof_mode="${kof_mode:-lean}"
     kof_storage_ha="${kof_storage_ha:-true}"
     # Reuse MKE4's built-in monitoring: drop KOF's duplicate node-exporter (KOF
     # already scrapes MKE's via cluster-wide ServiceMonitor discovery) + add MKE's
     # Prometheus as a Grafana datasource. KSM is kept (unique k0rdent CR metrics).
-    kof_reuse_mke_monitoring="${kof_reuse_mke_monitoring:-false}"
+    kof_reuse_mke_monitoring="${kof_reuse_mke_monitoring:-true}"
     # Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so
     # pod CPU/memory aren't double-counted. On by default when reuse is enabled.
     kof_reuse_mke_kubelet="${kof_reuse_mke_kubelet:-true}"
@@ -149,7 +149,7 @@ load_config() {
     kof_lean_prune_dashboards="${kof_lean_prune_dashboards:-kps-nodes-aix,kps-nodes-darwin}"
     kof_grafana_enabled="${kof_grafana_enabled:-true}"
     kof_grafana_image_tag="${kof_grafana_image_tag:-11.0.0}"
-    kof_grafana_gateway_enabled="${kof_grafana_gateway_enabled:-false}"
+    kof_grafana_gateway_enabled="${kof_grafana_gateway_enabled:-true}"
     kof_grafana_nodeport="${kof_grafana_nodeport:-33002}"
     kof_grafana_lb_port="${kof_grafana_lb_port:-8443}"
 
@@ -203,7 +203,7 @@ airgap_registry_disk_gb  = ${airgap_registry_disk_gb}
 nfs_enabled              = ${nfs_enabled}
 nfs_flavor               = "${nfs_flavor}"
 nfs_disk_gb              = ${nfs_disk_gb}
-kof_grafana_gateway_enabled = ${kof_grafana_gateway_enabled:-false}
+kof_grafana_gateway_enabled = ${kof_grafana_gateway_enabled:-true}
 kof_grafana_nodeport     = ${kof_grafana_nodeport:-33002}
 kof_grafana_lb_port      = ${kof_grafana_lb_port:-8443}
 k0rdent_ui_enabled       = ${k0rdent_ui_enabled:-false}
