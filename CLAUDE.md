@@ -57,6 +57,11 @@ t deploy registry mke3         # Setup MSR4 (Harbor) + upload MKE3 images
 t deploy cluster mke3-airgap   # DNS + proxy + launchpad from bastion
 t destroy cluster mke3-airgap  # launchpad reset from bastion
 
+# KOF observability (requires MKE 4.2.0+; kof_enabled=true auto-runs it in lab deploys)
+t deploy kof [full|lean]        # Deploy KOF on an existing cluster (online)
+t deploy kof [full|lean] airgap # Deploy KOF from the bastion (charts/images from internal registry)
+t destroy kof                   # helm uninstall + delete ns kof (auto-detects airgap)
+
 # Common
 t status                  # kubectl get nodes
 t show nodes              # Print IPs + NLB DNS
@@ -68,6 +73,7 @@ t tunnel                  # Show available tunnels with manual SSH commands
 t tunnel dashboard        # MKE4k Dashboard → https://localhost:3000
 t tunnel mke3             # MKE3 Dashboard  → https://localhost:3000
 t tunnel registry         # Harbor Registry  → https://localhost:8443
+t tunnel grafana          # KOF Grafana      → https://localhost:8443 (shares the 8443 -p mapping)
 ```
 
 ## Usage (Local)
@@ -92,10 +98,13 @@ Edit `config` before deploying. Key variables:
 | `worker_count` | `1` | |
 | `cluster_flavor` | `m5.xlarge` | Minimum recommended |
 | `region` | `eu-central-1` | |
-| `mke4k_version` | `v4.1.2` | mkectl is auto-downloaded at this version |
+| `mke4k_version` | `v4.2.0` | mkectl is auto-downloaded at this version |
 | `os_distro` | `ubuntu-22.04` | `ubuntu-22.04` or `ubuntu-24.04` |
-| `ccm_enabled` | `true` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap (no AWS API access) |
-| `debug` | `false` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
+| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap (no AWS API access) |
+| `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA) |
+| `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
+| `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |
+| `kof_mode` | `lean` | KOF scope: `full` (observability + FinOps) or `lean` (cluster monitoring only). Grafana + HTTPS gateway and MKE-monitoring reuse are on by default (advanced settings) |
 | `airgap_registry_flavor` | `t3.xlarge` | Bastion/registry instance type |
 | `airgap_registry_disk_gb` | `100` | Bastion root volume size (holds Harbor + image bundle) |
 | `airgap_msr_version` | `v4.13.3` | MSR4 (Harbor) version for the airgap registry |

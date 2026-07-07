@@ -18,9 +18,9 @@ docker pull registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 docker run -it --name mke4k-lab registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 
 # For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8444 = MSR4 (Harbor) UI
+#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry / KOF Grafana, 8444 = MSR4 (Harbor) UI
 docker run -it --name mke4k-lab \
-  -p 3000:3000 -p 8444:8444 \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
   registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 ```
 
@@ -43,9 +43,9 @@ docker build -t mke4k-lab .
 docker run -it --name mke4k-lab mke4k-lab
 
 # For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8444 = MSR4 (Harbor) UI
+#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry / KOF Grafana, 8444 = MSR4 (Harbor) UI
 docker run -it --name mke4k-lab \
-  -p 3000:3000 -p 8444:8444 \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
   mke4k-lab
 ```
 
@@ -97,7 +97,7 @@ controller_count=1
 worker_count=1
 cluster_flavor="m5.xlarge"
 region="eu-central-1"
-mke4k_version="v4.1.2"
+mke4k_version="v4.2.0"
 os_distro="ubuntu-22.04"       # ubuntu-22.04 or ubuntu-24.04
 ```
 
@@ -123,11 +123,10 @@ This will:
 
 Each recipe is just **(1) a handful of edits in `config`** + **(2) one command**. All of them assume you're already inside the container (`docker start -ai mke4k-lab`) with AWS credentials exported. Only the lines that differ from the shipped `config` are shown.
 
-### Deploy MKE4k v4.1.5 (online)
+### Deploy MKE4k v4.2.0 (online)
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 ccm_enabled=true          # enable for LoadBalancer services / EBS volumes
 ```
 
@@ -135,11 +134,10 @@ ccm_enabled=true          # enable for LoadBalancer services / EBS volumes
 t deploy lab
 ```
 
-### Deploy MKE4k v4.1.5 — HA control plane (3 controllers)
+### Deploy MKE4k v4.2.0 — HA control plane (3 controllers)
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 controller_count=3        # must be odd
 worker_count=2
 ccm_enabled=true
@@ -149,13 +147,12 @@ ccm_enabled=true
 t deploy lab
 ```
 
-### Deploy MKE4k v4.1.5 airgap
+### Deploy MKE4k v4.2.0 airgap
 
 Cluster nodes sit in a private subnet with no internet; a bastion runs Harbor and the bundle is mirrored locally. CCM is auto-disabled (no AWS API from the private subnet).
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 airgap_registry_disk_gb=100      # holds Harbor + the mirrored bundle
 ```
 
@@ -163,15 +160,14 @@ airgap_registry_disk_gb=100      # holds Harbor + the mirrored bundle
 t deploy lab airgap
 ```
 
-> Airgap bundles only exist for GA versions. If `v4.1.5` has no published bundle, either pick a GA version or set `mke4k_bundle_url=` to a reachable bundle.
+> Airgap bundles only exist for GA versions. If your chosen `mke4k_version` has no published bundle, either pick a GA version or set `mke4k_bundle_url=` to a reachable bundle.
 
-### Deploy MSR4 (Harbor) on a running MKE4k v4.1.5 cluster
+### Deploy MSR4 (Harbor) on a running MKE4k cluster
 
 MSR4 needs a StorageClass, so deploy with NFS first, then add MSR4.
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 nfs_enabled=true          # provides the nfs-client StorageClass MSR4 needs
 msr4_enabled=true
 msr4_replicas=1           # simple mode: built-in DB + Redis
@@ -190,7 +186,6 @@ HA schedules replicas only on workers (controllers are tainted), so you need `wo
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 worker_count=2            # must be >= msr4_replicas
 nfs_enabled=true
 msr4_enabled=true
@@ -206,7 +201,6 @@ t deploy msr4
 
 ```bash
 # config
-mke4k_version="v4.1.5"
 nfs_enabled=true
 msr4_enabled=true
 ```
@@ -219,13 +213,11 @@ t tunnel msr4             # then browse https://localhost:8444  (needs -p 8444:8
 
 ### Deploy KOF observability (with Grafana over HTTPS)
 
+Grafana and its HTTPS gateway are on by default, and `nfs_enabled=true` (the shipped default) provides the StorageClass KOF's PVCs need — so one line is enough:
+
 ```bash
 # config
-mke4k_version="v4.1.5"
-nfs_enabled=true                   # KOF's VictoriaMetrics/Logs/Traces PVCs need a StorageClass
-kof_enabled=true                   # auto-runs at the end of 't deploy lab'
-kof_grafana_enabled=true
-kof_grafana_gateway_enabled=true   # exposes Grafana via NLB listener (runs terraform apply)
+kof_enabled=true          # auto-runs at the end of 't deploy lab'
 ```
 
 ```bash
@@ -233,12 +225,36 @@ t deploy lab
 # Grafana: https://<nlb-dns>:8443  (login printed in the deploy summary)
 ```
 
+The default scope is `lean` (cluster monitoring only). For the complete observability + FinOps platform set `kof_mode="full"` — or skip `kof_enabled` entirely and deploy later on the running cluster:
+
+```bash
+t deploy kof              # lean (default)
+t deploy kof full         # full platform
+```
+
+### Deploy KOF on an airgap cluster
+
+The MKE 4.2.0 offline bundle ships all KOF charts and images, so the bastion's Harbor already has everything after `t deploy lab airgap`. The Grafana gateway is auto-enabled in airgap (it is the only path to Grafana).
+
+```bash
+# config
+kof_enabled=true          # auto-runs at the end of 't deploy lab airgap'
+```
+
+```bash
+t deploy lab airgap
+# or on an existing airgap cluster:
+t deploy kof airgap       # add full|lean before 'airgap' to override kof_mode
+
+t tunnel grafana          # then browse https://localhost:8443  (needs -p 8443:8443)
+```
+
 ### Deploy MKE3 v3.8.2, then test the in-place upgrade to MKE4k
 
 ```bash
 # config
 mke3_version="3.8.2"
-mke4k_version="v4.1.5"    # the upgrade target
+mke4k_version="v4.2.0"    # the upgrade target (shipped default)
 ```
 
 ```bash
@@ -325,22 +341,27 @@ Exposed as `NodePort 33443` (HTTPS) on every cluster node. Two-tier TLS PKI; ser
 
 | Command | Description |
 |---|---|
-| `t deploy kof` | Deploy KOF self-monitoring stack on existing MKE4k cluster (online) |
-| `t destroy kof` | Uninstall KOF (helm uninstall + delete namespace) |
+| `t deploy kof [full\|lean]` | Deploy KOF self-monitoring stack on existing MKE4k cluster (online). Mode defaults to `kof_mode` (`lean`) |
+| `t deploy kof [full\|lean] airgap` | Deploy KOF from the bastion against the internal registry (airgap) |
+| `t destroy kof` | Uninstall KOF (helm uninstall + delete namespace; auto-detects airgap) |
 
-KOF (k0rdent Observability & FinOps) is deployed in **online self-monitoring (M2M) mode**: the MKE4k cluster stores its own metrics, logs, and traces locally — no regional cluster, no child `ClusterDeployment`, no external DNS, no Istio. Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (MKE 4.2.0).
+KOF (k0rdent Observability & FinOps) is deployed in **self-monitoring (M2M) mode**: the MKE4k cluster stores its own metrics, logs, and traces locally — no regional cluster, no child `ClusterDeployment`, no external DNS, no Istio. Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (**requires MKE 4.2.0+**). Two scopes: `full` (complete observability + FinOps platform) and `lean` (cluster monitoring only — drops tracing, FinOps, and dead dashboards). The default is `lean` (`kof_mode` in `config`); override per-run with `t deploy kof full`.
 
-Set `kof_enabled=true` in `config` to auto-deploy KOF at the end of `t deploy lab`, or run `t deploy kof` against an already-running cluster. It **requires a StorageClass** — set `nfs_enabled=true` (or run `t deploy nfs`) first; the deploy resolves the cluster default StorageClass, falling back to `nfs-client`, and dies with an actionable message if neither exists.
+Set `kof_enabled=true` in `config` to auto-deploy KOF at the end of `t deploy lab` / `t deploy lab airgap`, or run `t deploy kof` (online) / `t deploy kof airgap` against an already-running cluster. It **requires a StorageClass** — set `nfs_enabled=true` (or run `t deploy nfs`) first; the deploy resolves the cluster default StorageClass, falling back to `nfs-client`, and dies with an actionable message if neither exists.
 
-KOF installs as a **FluxCD-sequenced OCI umbrella Helm chart** (`oci://registry.mirantis.com/k0rdent-enterprise/charts/kof`) via **helm v3** (helm v4 has a webhook bug). The committed, version-pinned asset `kof/global-values.yaml` repoints every subchart image to `registry.mirantis.com/k0rdent-enterprise`; `kof_registry` is an override seam for a future airgap pass. The deploy is idempotent (`helm upgrade -i`).
+KOF installs as a **FluxCD-sequenced OCI umbrella Helm chart** (`oci://registry.mirantis.com/k0rdent-enterprise/charts/kof`) via **helm v3** (helm v4 has a webhook bug). The committed, version-pinned asset `kof/global-values.yaml` repoints every subchart image to `kof_registry`. The deploy is idempotent (`helm upgrade -i`).
+
+**Airgap:** the MKE 4.2.0 offline bundle ships all KOF charts and images, so after `t deploy lab airgap` the bastion's Harbor already holds everything KOF needs. `t deploy kof airgap` runs the whole install from the bastion (helm/kubectl/mkectl there), auto-derives `kof_registry` to `<registry-hostname>/mke`, auto-enables the Grafana gateway (the only path to Grafana in airgap), and prints `t tunnel grafana` access at the end.
+
+**MKE-monitoring reuse (default on):** `kof_reuse_mke_monitoring=true` reuses MKE4's built-in monitoring instead of duplicating it — drops KOF's own node-exporter and kube-proxy/coredns/apiserver scrapes (KOF already scrapes MKE's, same labels), makes KOF's kube-state-metrics custom-resource-only, and adds MKE's Prometheus as a Grafana datasource. The sub-option `kof_reuse_mke_kubelet=true` (also default) additionally drops KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted. Set both to `false` to run KOF's full scrape set alongside MKE's.
 
 The umbrella and mothership charts default every k0rdent (KCM) namespace to `kcm-system`, but MKE4k's k0rdent Enterprise build runs k0rdent in the `k0rdent` namespace. `kof_kcm_namespace` (default `k0rdent`) repoints all of them — the umbrella Flux `HelmRepository`/`HelmChart` objects, the KCM integration, and the per-`ServiceTemplate` Flux repos created by mothership's pre-install hooks — and the preflight dies if that namespace is missing. Because this is self-monitoring only, the `kof-regional` and `kof-child` charts (regional/child cluster templates) are disabled.
 
 Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelemetry-operator` service account from MKE4k's built-in `ucpauthz` admission policy (via `mkectl config get` → patch `spec.apiServer.ucpauthz` → `mkectl apply`). Without this, the OpenTelemetry operator is blocked from creating its collector DaemonSets, so node/host-log collection silently never starts. The step is idempotent — it merges into any existing exemptions and skips the (heavyweight) `mkectl apply` when `kof` is already exempt.
 
-**Grafana (opt-in):** Mirantis no longer ships Grafana with KOF. Set `kof_grafana_enabled=true` to have `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). Access by port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`. The admin login (from secret `grafana-admin-credentials`) is resolved and printed in the deploy output (`Grafana login: <user> / <pass>`).
+**Grafana (default on):** Mirantis no longer ships Grafana with KOF; `kof_grafana_enabled=true` (the default) has `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). The admin login (from secret `grafana-admin-credentials`) is resolved and printed in the deploy output (`Grafana login: <user> / <pass>`).
 
-**Grafana over HTTPS (opt-in, touches terraform):** Set `kof_grafana_gateway_enabled=true` (requires `kof_grafana_enabled=true`) to expose Grafana via a dedicated Envoy **Gateway API** gateway instead of port-forward. `t deploy kof` then also runs `terraform apply` to add an NLB listener (`kof_grafana_lb_port`, default `8443`) + a security-group rule for a pinned Envoy NodePort (`kof_grafana_nodeport`, default `33002`), and applies `kof/grafana-gateway.yaml` (a self-contained `Issuer`/`Certificate`/`EnvoyProxy`/`Gateway`/`HTTPRoute` in the `kof` namespace, on the `mke-gateway-ingress` GatewayClass). TLS is self-signed (cert SANs = NLB DNS + node public IPs), terminated at the gateway; the NLB listener is plain TCP pass-through. Access: `https://<nlb-dns>:8443` (or `https://<node-public-ip>:33002`) — no `/etc/hosts` needed (dedicated listener, no host routing). dex/OIDC is not wired (Grafana's admin login is used).
+**Grafana over HTTPS (default on, touches terraform when online):** `kof_grafana_gateway_enabled=true` (the default; requires `kof_grafana_enabled=true`) exposes Grafana via a dedicated Envoy **Gateway API** gateway instead of port-forward. Online, `t deploy kof` also runs `terraform apply` to add an NLB listener (`kof_grafana_lb_port`, default `8443`) + a security-group rule for a pinned Envoy NodePort (`kof_grafana_nodeport`, default `33002`), and applies `kof/grafana-gateway.yaml` (a self-contained `Issuer`/`Certificate`/`EnvoyProxy`/`Gateway`/`HTTPRoute` in the `kof` namespace, on the `mke-gateway-ingress` GatewayClass). TLS is self-signed (cert SANs = NLB DNS + node public IPs), terminated at the gateway; the NLB listener is plain TCP pass-through. Access: `https://<nlb-dns>:8443` (or `https://<node-public-ip>:33002`) — no `/etc/hosts` needed (dedicated listener, no host routing). dex/OIDC is not wired (Grafana's admin login is used). In airgap the terraform step is skipped (internal NLB) and access is via `t tunnel grafana` → `https://localhost:8443`. Set the flag to `false` to fall back to port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`.
 
 **Access (built-in VMUI, always available):**
 - Logs: `kubectl -n kof port-forward svc/kof-storage-victoria-logs-cluster-vlselect 9471:9471` → `http://localhost:9471/select/vmui/`
@@ -350,18 +371,14 @@ Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelem
 **Example — deploy KOF with Grafana over HTTPS on a running lab:**
 
 ```bash
-# 1. Ensure a StorageClass exists (KOF's PVCs need one). nfs_enabled=true in
-#    config provisions it during 't deploy lab'; otherwise add it on demand:
+# 1. Ensure a StorageClass exists (KOF's PVCs need one). nfs_enabled=true (the
+#    shipped default) provisions it during 't deploy lab'; otherwise add it on demand:
 t deploy nfs
 
-# 2. Turn on KOF + Grafana + the HTTPS gateway in config:
-#      kof_enabled=true              # (optional) also auto-runs at end of 't deploy lab'
-#      kof_grafana_enabled=true
-#      kof_grafana_gateway_enabled=true
-vi config
-
-# 3. Deploy KOF on the existing cluster. Because the gateway is enabled this
-#    also runs 'terraform apply' to add the NLB listener + SG rule (idempotent).
+# 2. Deploy KOF on the existing cluster. Grafana + the HTTPS gateway are on by
+#    default, so this also runs 'terraform apply' to add the NLB listener +
+#    SG rule (idempotent). Default scope is lean; use 't deploy kof full' for
+#    the complete observability + FinOps platform.
 t deploy kof
 
 # The deploy output ends with the access block, e.g.:
@@ -370,11 +387,11 @@ t deploy kof
 #                      or https://<node-public-ip>:33002
 #     Grafana login:  admin / <generated-password>
 
-# 4. Tear down just KOF when done (leaves the cluster intact):
+# 3. Tear down just KOF when done (leaves the cluster intact):
 t destroy kof
 ```
 
-> With `kof_enabled=true`, step 3 runs automatically at the end of `t deploy lab` — no separate `t deploy kof` needed.
+> With `kof_enabled=true` in `config`, step 2 runs automatically at the end of `t deploy lab` — no separate `t deploy kof` needed. The same applies to `t deploy lab airgap` (KOF then installs from the bastion; Grafana via `t tunnel grafana`).
 
 ### Tunnels (airgap)
 
@@ -385,6 +402,7 @@ t destroy kof
 | `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 (optional; the bastion's Harbor is also reachable directly at `https://<bastion-public-ip>`) |
 | `t tunnel msr4` | MSR4 Harbor UI tunnel -> https://localhost:8444 |
+| `t tunnel grafana` | KOF Grafana tunnel -> https://localhost:8443 (shares the local port with `t tunnel registry` — run one at a time) |
 
 ### General
 
@@ -491,6 +509,10 @@ t tunnel registry
 t tunnel msr4
 # then browse https://localhost:8444
 
+# Airgap: access KOF Grafana (requires -p 8443:8443 on docker run)
+t tunnel grafana
+# then browse https://localhost:8443
+
 # Teardown
 t destroy lab
 ```
@@ -507,14 +529,14 @@ t destroy lab
 | `cluster_flavor` | `m5.xlarge` | EC2 instance type |
 | `region` | `eu-central-1` | AWS region |
 | `os_distro` | `ubuntu-22.04` | OS: `ubuntu-22.04` or `ubuntu-24.04` |
-| `ccm_enabled` | `true` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
-| `debug` | `false` | `true` adds `-l debug` to mkectl (all modes including airgap) |
+| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
+| `debug` | `true` | `true` adds `-l debug` to mkectl (all modes including airgap) |
 
 ### MKE4k settings
 
 | Variable | Default | Description |
 |---|---|---|
-| `mke4k_version` | `v4.1.2` | MKE4k / mkectl version |
+| `mke4k_version` | `v4.2.0` | MKE4k / mkectl version |
 
 ### MKE3 settings
 
@@ -540,7 +562,7 @@ t destroy lab
 
 | Variable | Default | Description |
 |---|---|---|
-| `nfs_enabled` | `false` | Provisions NFS server EC2, installs nfs-common on nodes, deploys nfs-subdir-external-provisioner |
+| `nfs_enabled` | `true` | Provisions NFS server EC2, installs nfs-common on nodes, deploys nfs-subdir-external-provisioner |
 | `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
 | `nfs_disk_gb` | `150` | Root volume size (GB) for the NFS server. Sized with headroom for KOF's VictoriaMetrics/Logs/Traces PVCs, which land on `nfs-client` |
 | `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
@@ -561,16 +583,21 @@ t destroy lab
 
 | Variable | Default | Description |
 |---|---|---|
-| `kof_enabled` | `false` | Auto-deploy KOF (self-monitoring/M2M) at the end of `t deploy lab`. `t deploy kof` works standalone regardless. Requires a StorageClass |
+| `kof_enabled` | `false` | Auto-deploy KOF (self-monitoring/M2M) at the end of `t deploy lab` / `t deploy lab airgap`. Even when `false`, KOF can be deployed later with `t deploy kof` / `t deploy kof airgap`. Requires a StorageClass |
+| `kof_mode` | `lean` | Deployment scope: `full` (complete observability + FinOps platform) or `lean` (cluster monitoring only). Override per-run: `t deploy kof full` / `t deploy kof lean` |
 | `kof_version` | `1.8.1` | KOF Helm umbrella-chart version (matches k0rdent Enterprise 1.3.2 / MKE 4.2.0) |
 | `kof_storage_size` | `10Gi` | PVC size for the VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes (doc default is 100Gi) |
-| `kof_registry` | `registry.mirantis.com/k0rdent-enterprise` | Image/chart registry. Override seam for future airgap; leave default for online |
+| `kof_storage_ha` | `true` | Keep VictoriaMetrics/VictoriaLogs in HA (cluster) topology. Applies to both modes |
+| `kof_registry` | `registry.mirantis.com/k0rdent-enterprise` | Image/chart registry. In airgap it is auto-derived to `<registry-hostname>/mke`; override only for a different custom registry |
 | `kof_kcm_namespace` | `k0rdent` | Namespace where k0rdent (KCM) runs. KOF's upstream default is `kcm-system`, but MKE4k's k0rdent Enterprise uses `k0rdent`; the KOF Flux objects + KCM integration are created here |
-| `kof_grafana_enabled` | `false` | Deploy Grafana (grafana-operator + datasources/dashboards + the `kof/grafana.yaml` instance CR). Grafana is no longer shipped with KOF by default |
+| `kof_grafana_enabled` | `true` | Deploy Grafana (grafana-operator + datasources/dashboards + the `kof/grafana.yaml` instance CR). Grafana is no longer shipped with KOF by default |
 | `kof_grafana_image_tag` | `11.0.0` | Grafana image tag in `<kof_registry>/grafana/grafana` (the registry ships `11.0.0`, not the doc's `10.4.18-security-01`) |
-| `kof_grafana_gateway_enabled` | `false` | Expose Grafana over HTTPS via a dedicated Envoy Gateway + NLB listener (requires `kof_grafana_enabled`). **Touches terraform** — `t deploy kof` runs `terraform apply` |
+| `kof_grafana_gateway_enabled` | `true` | Expose Grafana over HTTPS via a dedicated Envoy Gateway + NLB listener (requires `kof_grafana_enabled`). **Touches terraform** online — `t deploy kof` runs `terraform apply`. In airgap the gateway is auto-enabled regardless (access via `t tunnel grafana`) |
 | `kof_grafana_nodeport` | `33002` | NodePort the Grafana Envoy gateway is pinned to (opened in the cluster SG; NLB target group forwards here). Range 32768-35535 |
-| `kof_grafana_lb_port` | `8443` | NLB listener port for Grafana (TCP pass-through; the gateway terminates TLS) |
+| `kof_grafana_lb_port` | `8443` | NLB listener port for Grafana (TCP pass-through; the gateway terminates TLS). In airgap this is the local port of `t tunnel grafana` |
+| `kof_reuse_mke_monitoring` | `true` | Reuse MKE4's built-in monitoring instead of duplicating it (drops KOF's node-exporter + kube-proxy/coredns/apiserver scrapes, KSM custom-resource-only, adds MKE's Prometheus as Grafana datasource) |
+| `kof_reuse_mke_kubelet` | `true` | Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted (~2x otherwise) |
+| `kof_sf_notifier_enabled` | `false` | Route alerts with severity critical\|warning\|error to the sf-notifier webhook. sf-notifier itself is deployed separately by hand — leave `false` unless it is running |
 
 ## Airgap Architecture
 

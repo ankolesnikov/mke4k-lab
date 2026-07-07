@@ -1,0 +1,45 @@
+# KOF deployment profile: LEAN
+# ---------------------------------------------------------------------------
+# Cluster-monitoring-only KOF for customer-scenario labs. Same monitoring
+# fidelity as full (Grafana, VictoriaMetrics + VictoriaLogs in HA, pod-stdout +
+# host/syslog logs, kubelet/cAdvisor, all Kcm + Nvidia dashboards) but drops the
+# pieces that carry no data on a self-monitoring cluster:
+#   - VictoriaTraces  (nothing emits spans in M2M)
+#   - OpenCost/FinOps (cost reporting, out of scope for health monitoring)
+#   - the dead dashboards left behind by the above + OS-specific clutter
+#
+# Dashboards are curated AFTER install by the deploy script (the chart renders
+# every dashboard CR unconditionally — there is no values toggle). The prune
+# lists are config vars, edit them in `config`:
+#   kof_lean_prune_folders    (default: Istio,Opencost,Victoria Traces)
+#   kof_lean_prune_dashboards (default: kps-nodes-aix,kps-nodes-darwin)
+#
+# This file is the editable "scope" overlay; see kof/profiles/full.yaml for the
+# annotated baseline.
+
+# Self-monitoring only (see full.yaml).
+kof-regional:
+  enabled: false
+kof-child:
+  enabled: false
+
+kof-storage:
+  enabled: true
+  values:
+    # No tracing in lean — removes vtstorage/vtinsert/vtselect + their PVC.
+    victoria-traces-cluster:
+      enabled: false
+
+kof-collectors:
+  enabled: true
+  values:
+    # No FinOps in lean — removes the OpenCost deployment.
+    opencost:
+      enabled: false
+    kcm:
+      monitoring: true
+    opentelemetry-kube-stack:
+      clusterName: mothership
+      # See full.yaml — avoid the :9100 clash with MKE's node-exporter.
+      prometheus-node-exporter:
+        hostNetwork: false

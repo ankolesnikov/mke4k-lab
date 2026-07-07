@@ -28,3 +28,9 @@ mke3/
 Dockerfile
 CLAUDE.md
 README.md
+kof/MKE4-INTEGRATION.md
+kof/INSTALL-MKE.md
+kof/KOF-RUNBOOK.md
+kof/KOF-ON-MKE4.md
+kof/KOF-QUICKSTART.md
+.markdownlint.json

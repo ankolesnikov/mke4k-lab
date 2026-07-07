@@ -23,3 +23,11 @@ terraform/msr4_tls.crt
 terraform/msr4_tls.key
 terraform/msr4_tls.csr
 terraform/msr4_redis_password.txt
+
+# Local-only personal notes (never tracked)
+kof/MKE4-INTEGRATION.md
+kof/INSTALL-MKE.md
+kof/KOF-RUNBOOK.md
+kof/KOF-ON-MKE4.md
+kof/KOF-QUICKSTART.md
+.markdownlint.json

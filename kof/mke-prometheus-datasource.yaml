@@ -1,0 +1,25 @@
+# MKE4's built-in Prometheus, registered as an extra datasource in KOF's Grafana.
+# Applied by `t deploy kof` when kof_reuse_mke_monitoring=true (kof_add_mke_datasource).
+#
+# MKE4 runs a kube-prometheus-stack in the `mke` namespace; its Prometheus is
+# reachable in-cluster at the operated service prometheus-operated.mke:9090. This
+# gives a one-pane view of MKE's native metrics alongside KOF's VictoriaMetrics
+# without duplicating collection. The grafana-operator reconciles this CR into the
+# KOF Grafana instance via the shared instanceSelector label (dashboards: grafana).
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: mke-prometheus
+  namespace: kof
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana
+  datasource:
+    name: MKE Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus-operated.mke:9090
+    isDefault: false
+    jsonData:
+      timeInterval: 30s
