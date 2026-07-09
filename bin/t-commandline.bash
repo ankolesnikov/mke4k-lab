@@ -641,8 +641,8 @@ RESOLVEOF
 # - nm-cloud-setup: enabled on RHEL EC2 AMIs; its routing rules are a documented
 #   k0s/Kubernetes incompatibility, and it also rewrites /etc/resolv.conf.
 #   Disabling requires a reboot to drop the already-installed rules.
-# - SELinux → permissive: removes an install-failure class for mkectl/launchpad
-#   (no reboot needed; enforcing support is a live-test follow-up).
+# - SELinux: MKE 4.1.3+ supports SELinux enforcing, so it is left as-is. For
+#   older MKE4k target versions it is set to permissive (no reboot needed).
 # - firewalld/nftables: defensive — usually absent on RHEL EC2 AMIs, but would
 #   block Kubernetes ports if present.
 setup_rhel_node_prereqs() {
@@ -665,12 +665,22 @@ setup_rhel_node_prereqs() {
 
     info "Preparing ${#all_ips[@]} RHEL node(s) (nm-cloud-setup, SELinux, firewalld)..."
 
-    local prereq_script='
-        set -euo pipefail
+    # MKE 4.1.3+ supports SELinux enforcing — leave it untouched. Older target
+    # versions get permissive to avoid a known install-failure class.
+    local selinux_script=""
+    if version_gte "${mke4k_version#v}" "4.1.3"; then
+        info "  SELinux: leaving enforcing (MKE ${mke4k_version} supports SELinux)"
+    else
+        info "  SELinux: setting permissive (MKE ${mke4k_version} < 4.1.3)"
+        selinux_script='
         if [ "$(getenforce)" = "Enforcing" ]; then
             sudo setenforce 0
         fi
-        sudo sed -i "s/^SELINUX=enforcing/SELINUX=permissive/" /etc/selinux/config
+        sudo sed -i "s/^SELINUX=enforcing/SELINUX=permissive/" /etc/selinux/config'
+    fi
+
+    local prereq_script='
+        set -euo pipefail'"${selinux_script}"'
         sudo systemctl disable --now firewalld 2>/dev/null || true
         sudo systemctl disable --now nftables 2>/dev/null || true
         if systemctl is-enabled nm-cloud-setup.service >/dev/null 2>&1 \
