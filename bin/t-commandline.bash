@@ -93,7 +93,25 @@ load_config() {
     : "${worker_flavor:?worker_flavor not set in config}"
     : "${region:?region not set in config}"
     : "${mke4k_version:?mke4k_version not set in config}"
-    : "${os_distro:?os_distro not set in config}"
+
+    # Cluster node OS. Legacy configs set os_distro="ubuntu-22.04"; map it.
+    if [[ -z "${os_name:-}" && -n "${os_distro:-}" ]]; then
+        os_name="${os_distro%%-*}"
+        os_version="${os_distro#*-}"
+        warn "os_distro is deprecated — set os_name=\"${os_name}\" os_version=\"${os_version}\" in config instead."
+    fi
+    : "${os_name:?os_name not set in config (ubuntu | redhat)}"
+    : "${os_version:?os_version not set in config (e.g. 22.04, 9.6)}"
+    case "${os_name}" in
+        ubuntu|redhat) ;;
+        *) die "os_name must be 'ubuntu' or 'redhat' (got: ${os_name})" ;;
+    esac
+    # MKE4-documented support matrix — warn (not die) on other versions
+    case "${os_name}-${os_version}" in
+        ubuntu-22.04|ubuntu-24.04|redhat-9.6|redhat-8.10) ;;
+        *) warn "${os_name} ${os_version} is not in the MKE4 supported OS matrix (ubuntu 22.04/24.04, redhat 9.6/8.10) — continuing anyway." ;;
+    esac
+
     # ccm_enabled defaults to true if not present in config
     ccm_enabled="${ccm_enabled:-true}"
 
@@ -196,7 +214,8 @@ controller_flavor        = "${controller_flavor}"
 worker_flavor            = "${worker_flavor}"
 region                   = "${region}"
 mke4k_version            = "${mke4k_version}"
-os_distro                = "${os_distro}"
+os_name                  = "${os_name}"
+os_version               = "${os_version}"
 ccm_enabled              = ${effective_ccm}
 mke3_enabled             = ${mke3_enabled}
 airgap_enabled           = ${airgap_enabled}
@@ -276,29 +295,77 @@ ensure_mkectl() {
 # SSH helpers (used for airgap bastion and general remote commands)
 # ---------------------------------------------------------------------------
 
-# Run a command on a remote host via SSH
-ssh_node() {
-    local ssh_key="${1}" ip="${2}"
-    shift 2
-    ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "${ssh_key}" "ubuntu@${ip}" "$@"
+# SSH login user for CLUSTER NODES (controllers/workers). The bastion and NFS
+# server always run Ubuntu, so anything targeting them uses the literal "ubuntu".
+node_ssh_user() {
+    case "${os_name:-}" in
+        redhat) echo "ec2-user" ;;
+        *)      echo "ubuntu"   ;;
+    esac
 }
 
-# Run a command on a remote host via SSH through bastion (ProxyJump)
-ssh_node_via_bastion() {
-    local ssh_key="${1}" bastion_ip="${2}" ip="${3}"
+# Ubuntu version of the bastion/NFS server: follows os_version when the cluster
+# nodes are Ubuntu, pinned to 22.04 otherwise.
+# NOTE: keep in sync with local.bastion_os_version in terraform/main.tf.
+bastion_os_version() {
+    case "${os_name:-}" in
+        ubuntu) echo "${os_version}" ;;
+        *)      echo "22.04"         ;;
+    esac
+}
+
+# Run a command on a remote host via SSH, explicit login user
+ssh_host() {
+    local user="${1}" ssh_key="${2}" ip="${3}"
     shift 3
+    ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "${ssh_key}" "${user}@${ip}" "$@"
+}
+
+# Run a command on an Ubuntu host via SSH (bastion, NFS server, or ubuntu nodes)
+ssh_node() {
+    ssh_host ubuntu "$@"
+}
+
+# Run a command on a remote host via SSH through bastion (ProxyJump), explicit
+# target user. The ProxyCommand user is always ubuntu (the bastion).
+ssh_via_bastion() {
+    local user="${1}" ssh_key="${2}" bastion_ip="${3}" ip="${4}"
+    shift 4
     ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
         -i "${ssh_key}" \
         -o "ProxyCommand=ssh -q -o StrictHostKeyChecking=no -i ${ssh_key} -W %h:%p ubuntu@${bastion_ip}" \
-        "ubuntu@${ip}" "$@"
+        "${user}@${ip}" "$@"
 }
 
-# Wait for SSH to become available
-wait_for_ssh() {
-    local ssh_key="${1}" ip="${2}" label="${3:-host}" max_wait=180
+# Run a command on a CLUSTER NODE via SSH through bastion (user follows os_name)
+ssh_node_via_bastion() {
+    ssh_via_bastion "$(node_ssh_user)" "$@"
+}
+
+# Wait for SSH to become available (explicit login user)
+wait_for_ssh_host() {
+    local user="${1}" ssh_key="${2}" ip="${3}" label="${4:-host}" max_wait=180
     info "Waiting for ${label} SSH (${ip})..."
     for (( i=0; i<max_wait; i+=5 )); do
-        if ssh_node "${ssh_key}" "${ip}" "true" 2>/dev/null; then
+        if ssh_host "${user}" "${ssh_key}" "${ip}" "true" 2>/dev/null; then
+            return 0
+        fi
+        sleep 5
+    done
+    die "${label} not reachable after ${max_wait}s"
+}
+
+# Wait for SSH on an Ubuntu host (bastion, NFS server)
+wait_for_ssh() {
+    wait_for_ssh_host ubuntu "$@"
+}
+
+# Wait for SSH on a CLUSTER NODE reached through the bastion (ProxyJump)
+wait_for_ssh_node_via_bastion() {
+    local ssh_key="${1}" bastion_ip="${2}" ip="${3}" label="${4:-node}" max_wait=300
+    info "Waiting for ${label} SSH (${ip} via bastion)..."
+    for (( i=0; i<max_wait; i+=5 )); do
+        if ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${ip}" "true" 2>/dev/null; then
             return 0
         fi
         sleep 5
@@ -338,12 +405,13 @@ setup_registry() {
 
     local reg_host="${registry_hostname}"
 
-    # Determine apt suite from os_distro (ubuntu-22.04 → jammy, ubuntu-24.04 → noble)
+    # Determine apt suite from the bastion's Ubuntu version (22.04 → jammy, 24.04 → noble).
+    # The bastion is always Ubuntu regardless of the cluster node OS.
     local apt_suite
-    case "${os_distro}" in
-        ubuntu-22.04) apt_suite="jammy"  ;;
-        ubuntu-24.04) apt_suite="noble"  ;;
-        *)            die "Unsupported os_distro for MCR install: ${os_distro}" ;;
+    case "$(bastion_os_version)" in
+        22.04) apt_suite="jammy" ;;
+        24.04) apt_suite="noble" ;;
+        *)     die "Unsupported bastion Ubuntu version for MCR install: $(bastion_os_version)" ;;
     esac
 
     # Install MCR + docker-compose-plugin-ee + bind9 (idempotent)
@@ -568,12 +636,90 @@ RESOLVEOF
 }
 
 # ---------------------------------------------------------------------------
-# Airgap — configure DNS on cluster nodes (point systemd-resolved at bastion)
+# RHEL cluster node preparation (no-op for Ubuntu)
+# ---------------------------------------------------------------------------
+# - nm-cloud-setup: enabled on RHEL EC2 AMIs; its routing rules are a documented
+#   k0s/Kubernetes incompatibility, and it also rewrites /etc/resolv.conf.
+#   Disabling requires a reboot to drop the already-installed rules.
+# - SELinux → permissive: removes an install-failure class for mkectl/launchpad
+#   (no reboot needed; enforcing support is a live-test follow-up).
+# - firewalld/nftables: defensive — usually absent on RHEL EC2 AMIs, but would
+#   block Kubernetes ports if present.
+setup_rhel_node_prereqs() {
+    [[ "${os_name}" == "redhat" ]] || return 0
+
+    local output ssh_key bastion_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    local is_airgap=false
+    [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" && "${bastion_ip}" != "" ]] && is_airgap=true
+
+    local all_ips=()
+    if [[ "${is_airgap}" == "true" ]]; then
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_private_ips.value[], .worker_private_ips.value[]' 2>/dev/null)
+    else
+        mapfile -t all_ips < <(echo "${output}" | jq -r '.controller_ips.value[], .worker_ips.value[]' 2>/dev/null)
+    fi
+    [[ ${#all_ips[@]} -eq 0 ]] && { warn "No cluster node IPs found — skipping RHEL prereqs."; return; }
+
+    info "Preparing ${#all_ips[@]} RHEL node(s) (nm-cloud-setup, SELinux, firewalld)..."
+
+    local prereq_script='
+        set -euo pipefail
+        if [ "$(getenforce)" = "Enforcing" ]; then
+            sudo setenforce 0
+        fi
+        sudo sed -i "s/^SELINUX=enforcing/SELINUX=permissive/" /etc/selinux/config
+        sudo systemctl disable --now firewalld 2>/dev/null || true
+        sudo systemctl disable --now nftables 2>/dev/null || true
+        if systemctl is-enabled nm-cloud-setup.service >/dev/null 2>&1 \
+           || systemctl is-enabled nm-cloud-setup.timer >/dev/null 2>&1; then
+            sudo systemctl disable --now nm-cloud-setup.service nm-cloud-setup.timer 2>/dev/null || true
+            echo NEEDS_REBOOT
+        fi
+        echo "RHEL prereqs done"
+    '
+
+    local node_ip node_out
+    for node_ip in "${all_ips[@]}"; do
+        info "  prereqs → ${node_ip}"
+        # Terraform returns before sshd is up — wait per node
+        if [[ "${is_airgap}" == "true" ]]; then
+            wait_for_ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "node ${node_ip}"
+            node_out="$(ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "${prereq_script}")"
+        else
+            wait_for_ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "node ${node_ip}"
+            node_out="$(ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "${prereq_script}")"
+        fi
+
+        if grep -q 'NEEDS_REBOOT' <<<"${node_out}"; then
+            info "  Rebooting ${node_ip} to drop nm-cloud-setup routing rules..."
+            if [[ "${is_airgap}" == "true" ]]; then
+                ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "sudo systemctl reboot" 2>/dev/null || true
+                sleep 10
+                wait_for_ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "node ${node_ip}"
+            else
+                ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "sudo systemctl reboot" 2>/dev/null || true
+                sleep 10
+                wait_for_ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "node ${node_ip}"
+            fi
+        fi
+    done
+
+    success "RHEL node prereqs applied."
+}
+
+# ---------------------------------------------------------------------------
+# Airgap — configure DNS on cluster nodes (point the resolver at bastion)
 # ---------------------------------------------------------------------------
 # bind9 runs on the bastion and resolves the registry hostname.
-# Each cluster node's systemd-resolved is configured to use the bastion
-# as its DNS server. This means both containerd (on the node) and CoreDNS
-# (which forwards to the node's upstream resolver) can resolve the hostname.
+# Each cluster node's resolver is configured to use the bastion as its DNS
+# server. This means both containerd (on the node) and CoreDNS (which forwards
+# to the node's upstream resolver) can resolve the hostname.
+# Ubuntu: via systemd-resolved. RHEL: NetworkManager owns /etc/resolv.conf and
+# systemd-resolved is not enabled — set dns=none so NM permanently stops
+# touching resolv.conf (survives DHCP renewals and reboots), then write it.
 setup_node_dns() {
     local output ssh_key bastion_ip bastion_private_ip
     output="$(tf_output)"
@@ -593,34 +739,61 @@ setup_node_dns() {
 
     for node_ip in "${all_ips[@]}"; do
         info "  DNS → ${node_ip}"
-        ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
-            set -euo pipefail
-            # Only configure if not already pointing at bastion
-            if grep -q '${bastion_private_ip}' /etc/systemd/resolved.conf 2>/dev/null; then
-                echo 'DNS already configured'
-                exit 0
-            fi
-            sudo tee /etc/systemd/resolved.conf > /dev/null <<'RESOLVEOF'
+        if [[ "${os_name}" == "redhat" ]]; then
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
+                # Only configure if not already pointing at bastion
+                if grep -q '${bastion_private_ip}' /etc/resolv.conf 2>/dev/null; then
+                    echo 'DNS already configured'
+                    exit 0
+                fi
+                # Stop NetworkManager managing resolv.conf (persists across
+                # DHCP renewals and reboots); reload keeps the interface up
+                sudo mkdir -p /etc/NetworkManager/conf.d
+                printf '[main]\ndns=none\n' | sudo tee /etc/NetworkManager/conf.d/90-dns-none.conf >/dev/null
+                sudo systemctl reload NetworkManager
+                # Preserve the VPC search domain so *.compute.internal keeps working
+                search_line=\$(grep '^search' /etc/resolv.conf 2>/dev/null || true)
+                { echo \"\${search_line}\"; echo 'nameserver ${bastion_private_ip}'; } \
+                    | grep -v '^\$' | sudo tee /etc/resolv.conf >/dev/null
+
+                # /etc/hosts fallback — ensures containerd resolves the registry
+                # even if the resolver is briefly unavailable during k0s startup
+                if ! grep -q '${registry_hostname}' /etc/hosts 2>/dev/null; then
+                    echo '${bastion_private_ip} ${registry_hostname}' | sudo tee -a /etc/hosts >/dev/null
+                fi
+            "
+        else
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
+                # Only configure if not already pointing at bastion
+                if grep -q '${bastion_private_ip}' /etc/systemd/resolved.conf 2>/dev/null; then
+                    echo 'DNS already configured'
+                    exit 0
+                fi
+                sudo tee /etc/systemd/resolved.conf > /dev/null <<'RESOLVEOF'
 [Resolve]
 DNS=${bastion_private_ip}
 FallbackDNS=
 Domains=~.
 RESOLVEOF
-            sudo systemctl restart systemd-resolved
+                sudo systemctl restart systemd-resolved
 
-            # /etc/hosts fallback — ensures containerd resolves the registry
-            # even if systemd-resolved is briefly unavailable during k0s startup
-            if ! grep -q '${registry_hostname}' /etc/hosts 2>/dev/null; then
-                echo '${bastion_private_ip} ${registry_hostname}' | sudo tee -a /etc/hosts >/dev/null
-            fi
-        "
+                # /etc/hosts fallback — ensures containerd resolves the registry
+                # even if systemd-resolved is briefly unavailable during k0s startup
+                if ! grep -q '${registry_hostname}' /etc/hosts 2>/dev/null; then
+                    echo '${bastion_private_ip} ${registry_hostname}' | sudo tee -a /etc/hosts >/dev/null
+                fi
+            "
+        fi
     done
 
     success "DNS configured on all cluster nodes."
 }
 
 # ---------------------------------------------------------------------------
-# Airgap — Squid forward proxy on bastion (for MCR APT install on airgap nodes)
+# Airgap — Squid forward proxy on bastion (MCR apt/dnf installs on airgap nodes;
+# also RHUI access for RHEL nodes — e.g. nfs-utils, container-selinux)
 # ---------------------------------------------------------------------------
 setup_squid_proxy() {
     local output ssh_key bastion_ip bastion_private_ip
@@ -649,6 +822,8 @@ acl cluster_nodes src 172.31.1.0/24
 acl allowed_domains dstdomain .mirantis.com .docker.com .docker.io
 acl allowed_domains dstdomain .ubuntu.com .canonical.com .amazonaws.com
 acl allowed_domains dstdomain .dl.k8s.io
+# RHEL nodes: RHUI (rhui.<region>.aws.ce.redhat.com) + possible CDN redirects
+acl allowed_domains dstdomain .redhat.com .cloudfront.net
 
 # SSL bump is NOT used — CONNECT tunnelling for HTTPS
 acl SSL_ports port 443
@@ -702,7 +877,9 @@ setup_node_proxy() {
     local lb_dns mke3_lb_dns
     lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // ""')"
     mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // ""')"
-    local no_proxy_list="localhost,127.0.0.1,${bastion_private_ip},${reg_host}"
+    # 169.254.169.254: RHEL's RHUI dnf plugin (amazon-id) reads the region from
+    # IMDS — that link-local call must never go through the proxy. Harmless on Ubuntu.
+    local no_proxy_list="localhost,127.0.0.1,169.254.169.254,${bastion_private_ip},${reg_host}"
     [[ -n "${lb_dns}" ]] && no_proxy_list="${no_proxy_list},${lb_dns}"
     [[ -n "${mke3_lb_dns}" ]] && no_proxy_list="${no_proxy_list},${mke3_lb_dns}"
     for ip in "${all_ips[@]}"; do
@@ -721,17 +898,22 @@ setup_node_proxy() {
         # SCP cert via bastion
         scp -q -o StrictHostKeyChecking=no -i "${ssh_key}" \
             -o "ProxyCommand=ssh -q -o StrictHostKeyChecking=no -i ${ssh_key} -W %h:%p ubuntu@${bastion_ip}" \
-            "${cert_file}" "ubuntu@${node_ip}:/tmp/registry_ca.crt"
+            "${cert_file}" "$(node_ssh_user)@${node_ip}:/tmp/registry_ca.crt"
 
-        ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
-            set -euo pipefail
+        if [[ "${os_name}" == "redhat" ]]; then
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
 
-            # APT proxy
-            echo 'Acquire::http::Proxy \"${proxy_url}\";
-Acquire::https::Proxy \"${proxy_url}\";' | sudo tee /etc/apt/apt.conf.d/01proxy >/dev/null
+                # dnf proxy — applies to all repos (RHUI + the Mirantis repo the
+                # MCR installer adds). RHUI repos stay ENABLED: docker-ee needs
+                # container-selinux from AppStream, and HTTPS-only RHUI through
+                # Squid is a pure CONNECT tunnel (no hash-mismatch risk).
+                if ! grep -q '^proxy=' /etc/dnf/dnf.conf 2>/dev/null; then
+                    echo 'proxy=${proxy_url}' | sudo tee -a /etc/dnf/dnf.conf >/dev/null
+                fi
 
-            # Environment proxy (pam_env.so reads on PAM login sessions)
-            sudo tee /etc/environment > /dev/null <<'ENVEOF'
+                # Environment proxy (pam_env.so reads on PAM login sessions)
+                sudo tee /etc/environment > /dev/null <<'ENVEOF'
 http_proxy=${proxy_url}
 https_proxy=${proxy_url}
 HTTP_PROXY=${proxy_url}
@@ -740,10 +922,10 @@ no_proxy=${no_proxy_list}
 NO_PROXY=${no_proxy_list}
 ENVEOF
 
-            # System-wide bashrc — sourced for all bash invocations including
-            # non-login SSH exec channels (which is how launchpad runs commands)
-            if ! grep -q 'http_proxy' /etc/bash.bashrc 2>/dev/null; then
-                sudo tee -a /etc/bash.bashrc > /dev/null <<'BASHRCEOF'
+                # System-wide bashrc — sourced for all bash invocations including
+                # non-login SSH exec channels (which is how launchpad runs commands)
+                if ! grep -q 'http_proxy' /etc/bashrc 2>/dev/null; then
+                    sudo tee -a /etc/bashrc > /dev/null <<'BASHRCEOF'
 
 # Proxy settings for airgap MCR installation
 export http_proxy=${proxy_url}
@@ -753,10 +935,10 @@ export HTTPS_PROXY=${proxy_url}
 export no_proxy=${no_proxy_list}
 export NO_PROXY=${no_proxy_list}
 BASHRCEOF
-            fi
+                fi
 
-            # Profile.d script for login shells
-            sudo tee /etc/profile.d/proxy.sh > /dev/null <<'PROFILEEOF'
+                # Profile.d script for login shells
+                sudo tee /etc/profile.d/proxy.sh > /dev/null <<'PROFILEEOF'
 export http_proxy=${proxy_url}
 export https_proxy=${proxy_url}
 export HTTP_PROXY=${proxy_url}
@@ -765,29 +947,86 @@ export no_proxy=${no_proxy_list}
 export NO_PROXY=${no_proxy_list}
 PROFILEEOF
 
-            # Preserve proxy vars through sudo
-            echo 'Defaults env_keep += \"http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY\"' \
-                | sudo tee /etc/sudoers.d/proxy-env >/dev/null
-            sudo chmod 440 /etc/sudoers.d/proxy-env
+                # Preserve proxy vars through sudo
+                echo 'Defaults env_keep += \"http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY\"' \
+                    | sudo tee /etc/sudoers.d/proxy-env >/dev/null
+                sudo chmod 440 /etc/sudoers.d/proxy-env
 
-            # Disable unattended-upgrades to prevent apt lock contention with launchpad
-            sudo systemctl disable --now unattended-upgrades 2>/dev/null || true
-            sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-            # Wait for any running apt/dpkg to finish
-            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+                # Avoid dnf metadata refresh contention with launchpad
+                sudo systemctl disable --now dnf-makecache.timer 2>/dev/null || true
 
-            # Disable default Ubuntu repos — they are huge, slow through proxy, and
-            # cause hash-sum-mismatch errors via Squid. Launchpad only needs the
-            # Mirantis repo (added by the MCR installer script). Base packages
-            # (curl, sudo, iptables) are already on the AMI.
-            sudo mv /etc/apt/sources.list /etc/apt/sources.list.disabled 2>/dev/null || true
-            sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled 2>/dev/null || true
+                # Docker registry CA trust (MCR will read this on start)
+                sudo mkdir -p /etc/docker/certs.d/${reg_host}
+                sudo cp /tmp/registry_ca.crt /etc/docker/certs.d/${reg_host}/ca.crt
+                rm -f /tmp/registry_ca.crt
+            "
+        else
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
 
-            # Docker registry CA trust (MCR will read this on start)
-            sudo mkdir -p /etc/docker/certs.d/${reg_host}
-            sudo cp /tmp/registry_ca.crt /etc/docker/certs.d/${reg_host}/ca.crt
-            rm -f /tmp/registry_ca.crt
-        "
+                # APT proxy
+                echo 'Acquire::http::Proxy \"${proxy_url}\";
+Acquire::https::Proxy \"${proxy_url}\";' | sudo tee /etc/apt/apt.conf.d/01proxy >/dev/null
+
+                # Environment proxy (pam_env.so reads on PAM login sessions)
+                sudo tee /etc/environment > /dev/null <<'ENVEOF'
+http_proxy=${proxy_url}
+https_proxy=${proxy_url}
+HTTP_PROXY=${proxy_url}
+HTTPS_PROXY=${proxy_url}
+no_proxy=${no_proxy_list}
+NO_PROXY=${no_proxy_list}
+ENVEOF
+
+                # System-wide bashrc — sourced for all bash invocations including
+                # non-login SSH exec channels (which is how launchpad runs commands)
+                if ! grep -q 'http_proxy' /etc/bash.bashrc 2>/dev/null; then
+                    sudo tee -a /etc/bash.bashrc > /dev/null <<'BASHRCEOF'
+
+# Proxy settings for airgap MCR installation
+export http_proxy=${proxy_url}
+export https_proxy=${proxy_url}
+export HTTP_PROXY=${proxy_url}
+export HTTPS_PROXY=${proxy_url}
+export no_proxy=${no_proxy_list}
+export NO_PROXY=${no_proxy_list}
+BASHRCEOF
+                fi
+
+                # Profile.d script for login shells
+                sudo tee /etc/profile.d/proxy.sh > /dev/null <<'PROFILEEOF'
+export http_proxy=${proxy_url}
+export https_proxy=${proxy_url}
+export HTTP_PROXY=${proxy_url}
+export HTTPS_PROXY=${proxy_url}
+export no_proxy=${no_proxy_list}
+export NO_PROXY=${no_proxy_list}
+PROFILEEOF
+
+                # Preserve proxy vars through sudo
+                echo 'Defaults env_keep += \"http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY\"' \
+                    | sudo tee /etc/sudoers.d/proxy-env >/dev/null
+                sudo chmod 440 /etc/sudoers.d/proxy-env
+
+                # Disable unattended-upgrades to prevent apt lock contention with launchpad
+                sudo systemctl disable --now unattended-upgrades 2>/dev/null || true
+                sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+                # Wait for any running apt/dpkg to finish
+                while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 2; done
+
+                # Disable default Ubuntu repos — they are huge, slow through proxy, and
+                # cause hash-sum-mismatch errors via Squid. Launchpad only needs the
+                # Mirantis repo (added by the MCR installer script). Base packages
+                # (curl, sudo, iptables) are already on the AMI.
+                sudo mv /etc/apt/sources.list /etc/apt/sources.list.disabled 2>/dev/null || true
+                sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled 2>/dev/null || true
+
+                # Docker registry CA trust (MCR will read this on start)
+                sudo mkdir -p /etc/docker/certs.d/${reg_host}
+                sudo cp /tmp/registry_ca.crt /etc/docker/certs.d/${reg_host}/ca.crt
+                rm -f /tmp/registry_ca.crt
+            "
+        fi
     done
 
     success "HTTP proxy + registry CA configured on all cluster nodes."
@@ -1321,9 +1560,9 @@ setup_nfs_server() {
                 /tmp/nfs-server-debs.tar.gz ubuntu@${nfs_ip}:/tmp/
         "
 
-        # Make sure we can reach the NFS server via bastion
+        # Make sure we can reach the NFS server via bastion (always Ubuntu)
         info "  Installing NFS server packages..."
-        ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${nfs_ip}" "
+        ssh_via_bastion ubuntu "${ssh_key}" "${bastion_ip}" "${nfs_ip}" "
             set -euo pipefail
             if dpkg -l nfs-kernel-server 2>/dev/null | grep -q '^ii'; then
                 echo 'nfs-kernel-server already installed'
@@ -1383,10 +1622,31 @@ install_nfs_client_on_nodes() {
 
     [[ ${#all_ips[@]} -eq 0 ]] && { warn "No cluster nodes found — skipping NFS client install."; return; }
 
-    info "Installing nfs-common on ${#all_ips[@]} cluster node(s)..."
+    info "Installing NFS client on ${#all_ips[@]} cluster node(s)..."
 
-    if [[ "${is_airgap}" == "true" ]]; then
-        # Download nfs-common packages on bastion
+    if [[ "${is_airgap}" == "true" && "${os_name}" == "redhat" ]]; then
+        # RHEL nodes: the Ubuntu bastion cannot build RPM bundles, so install
+        # nfs-utils via dnf through the bastion's Squid proxy against RHUI
+        # (requires setup_node_dns to have run so RHUI hostnames resolve).
+        # The proxy is passed per-command (--setopt) — no persistent proxy
+        # state is left on MKE4k-airgap nodes.
+        local bastion_private_ip
+        bastion_private_ip="$(echo "${output}" | jq -r '.bastion_private_ip.value')"
+        setup_squid_proxy
+        for node_ip in "${all_ips[@]}"; do
+            info "  nfs-utils → ${node_ip}"
+            ssh_node_via_bastion "${ssh_key}" "${bastion_ip}" "${node_ip}" "
+                set -euo pipefail
+                if rpm -q nfs-utils >/dev/null 2>&1; then
+                    echo 'nfs-utils already installed'
+                    exit 0
+                fi
+                sudo dnf -y -q --setopt=proxy=http://${bastion_private_ip}:3128 install nfs-utils >/dev/null
+                echo 'nfs-utils installed'
+            "
+        done
+    elif [[ "${is_airgap}" == "true" ]]; then
+        # Ubuntu nodes: download .deb bundle on the (Ubuntu) bastion, push + dpkg -i
         info "  Downloading nfs-common packages on bastion..."
         ssh_node "${ssh_key}" "${bastion_ip}" "
             set -euo pipefail
@@ -1422,6 +1682,19 @@ install_nfs_client_on_nodes() {
                 rm -rf nfs-client-debs nfs-client-debs.tar.gz
             "
         done
+    elif [[ "${os_name}" == "redhat" ]]; then
+        for node_ip in "${all_ips[@]}"; do
+            info "  nfs-utils → ${node_ip}"
+            ssh_host "$(node_ssh_user)" "${ssh_key}" "${node_ip}" "
+                set -euo pipefail
+                if rpm -q nfs-utils >/dev/null 2>&1; then
+                    echo 'nfs-utils already installed'
+                    exit 0
+                fi
+                sudo dnf -y -q install nfs-utils >/dev/null
+                echo 'nfs-utils installed'
+            "
+        done
     else
         for node_ip in "${all_ips[@]}"; do
             info "  nfs-common → ${node_ip}"
@@ -1436,7 +1709,7 @@ install_nfs_client_on_nodes() {
             "
         done
     fi
-    success "nfs-common installed on all cluster nodes."
+    success "NFS client installed on all cluster nodes."
 }
 
 deploy_nfs_provisioner() {
@@ -1625,16 +1898,17 @@ generate_mke4_yaml() {
     local hosts_json
     hosts_json="$(echo "${output}" | jq -c \
         --arg key "${key_path}" \
+        --arg user "$(node_ssh_user)" \
         --arg crole "${ctrl_role}" \
         --arg ctrl_field "${ctrl_ips_field}" \
         --arg wkr_field "${wkr_ips_field}" \
         '[
             (.[$ctrl_field].value[] | {
-                ssh: { address: ., user: "ubuntu", keyPath: $key },
+                ssh: { address: ., user: $user, keyPath: $key },
                 role: $crole
             }),
             (.[$wkr_field].value[] | {
-                ssh: { address: ., user: "ubuntu", keyPath: $key },
+                ssh: { address: ., user: $user, keyPath: $key },
                 role: "worker"
             })
         ]')"
@@ -1799,16 +2073,17 @@ generate_launchpad_yaml() {
     local hosts_json
     hosts_json="$(echo "${output}" | jq -c \
         --arg key "${key_path}" \
+        --arg user "$(node_ssh_user)" \
         --arg ctrl_field "${ctrl_ips_field}" \
         --arg wkr_field "${wkr_ips_field}" \
         '[
             (.[$ctrl_field].value[] | {
                 role: "manager",
-                ssh: { address: ., user: "ubuntu", keyPath: $key }
+                ssh: { address: ., user: $user, keyPath: $key }
             }),
             (.[$wkr_field].value[] | {
                 role: "worker",
-                ssh: { address: ., user: "ubuntu", keyPath: $key }
+                ssh: { address: ., user: $user, keyPath: $key }
             })
         ]')"
 
@@ -1871,11 +2146,12 @@ generate_nodes_yaml() {
     local nodes_json
     nodes_json="$(echo "${output}" | jq -c \
         --arg key "${key_path}" \
+        --arg user "$(node_ssh_user)" \
         --arg ctrl_field "${ctrl_field}" \
         --arg wkr_field "${wkr_field}" \
         '[
             (.[$ctrl_field].value[], .[$wkr_field].value[]) |
-            { address: ., port: 22, user: "ubuntu", keyPath: $key }
+            { address: ., port: 22, user: $user, keyPath: $key }
         ]')"
 
     printf 'hosts:\n' > "${nodes_yaml}"
@@ -2173,6 +2449,9 @@ EOF
     [[ -f "${ssh_key}" ]] \
         || die "SSH key not found at ${ssh_key}. Has terraform been applied?"
 
+    # Needed for os_name → node_ssh_user resolution
+    load_config
+
     local output
     output="$(tf_output 2>/dev/null)" || die "Could not read terraform output."
 
@@ -2185,7 +2464,14 @@ EOF
     local is_airgap=false
     [[ -n "${bastion_pub_ip}" && "${bastion_pub_ip}" != "null" && "${bastion_pub_ip}" != "" ]] && is_airgap=true
 
-    local ssh_opts=(-q -i "${ssh_key}" -o StrictHostKeyChecking=no -o BatchMode=no -l ubuntu)
+    # Bastion and NFS server are always Ubuntu; cluster nodes follow os_name
+    local conn_user
+    case "${target}" in
+        bastion|nfs) conn_user="ubuntu" ;;
+        *)           conn_user="$(node_ssh_user)" ;;
+    esac
+
+    local ssh_opts=(-q -i "${ssh_key}" -o StrictHostKeyChecking=no -o BatchMode=no -l "${conn_user}")
 
     # In airgap mode, non-bastion targets need ProxyJump through bastion
     if [[ "${is_airgap}" == "true" && "${target}" != "bastion" ]]; then
@@ -2607,6 +2893,7 @@ cmd_deploy_lab_mke4() {
     tf_init
     tf_apply
     timer_phase_end _T_TERRAFORM
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     wait_for_lb
     timer_phase_end _T_NLB
     generate_mke4_yaml
@@ -2638,6 +2925,7 @@ cmd_deploy_lab_mke3() {
     tf_init
     tf_apply
     timer_phase_end _T_TERRAFORM
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     wait_for_lb
     timer_phase_end _T_NLB
     generate_launchpad_yaml
@@ -2667,11 +2955,13 @@ cmd_deploy_instances_mke3() {
 
 cmd_deploy_cluster() {
     load_config
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     mkectl_apply
 }
 
 cmd_deploy_cluster_mke3() {
     load_config
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     generate_launchpad_yaml
     launchpad_apply
 }
@@ -2701,6 +2991,10 @@ cmd_deploy_lab_airgap() {
     setup_registry             # Docker + bind9 + MSR4 + cert + project
     timer_phase_end _T_REGISTRY
 
+    setup_node_dns             # Point each node's resolver at bastion — must run
+                               # before any RHEL dnf-via-Squid (RHUI resolution)
+    setup_rhel_node_prereqs    # no-op for Ubuntu
+
     local output ssh_key bastion_ip
     output="$(tf_output)"
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
@@ -2718,8 +3012,6 @@ cmd_deploy_lab_airgap() {
         install_nfs_client_on_nodes
         upload_nfs_provisioner_image
     fi
-
-    setup_node_dns             # Point each node's systemd-resolved at bastion
 
     wait_for_lb
     timer_phase_end _T_NLB
@@ -2769,6 +3061,7 @@ cmd_deploy_registry() {
 cmd_deploy_cluster_airgap() {
     load_config
     setup_node_dns             # Ensure DNS is configured before mkectl
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     local output ssh_key bastion_ip
     output="$(tf_output)"
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
@@ -2811,10 +3104,11 @@ cmd_deploy_lab_mke3_airgap() {
     upload_mke3_images         # Download MKE3 bundle + retag + push to Harbor/mke3
     timer_phase_end _T_MKE3_IMAGES
 
-    setup_node_dns             # Point each node's systemd-resolved at bastion
+    setup_node_dns             # Point each node's resolver at bastion
+    setup_rhel_node_prereqs    # no-op for Ubuntu
 
-    setup_squid_proxy          # Squid on bastion for MCR APT install
-    setup_node_proxy           # APT proxy + env vars + registry CA on nodes
+    setup_squid_proxy          # Squid on bastion for MCR package installs
+    setup_node_proxy           # apt/dnf proxy + env vars + registry CA on nodes
     timer_phase_end _T_PROXY
 
     local output ssh_key bastion_ip
@@ -2853,6 +3147,7 @@ cmd_deploy_registry_mke3() {
 cmd_deploy_cluster_mke3_airgap() {
     load_config
     setup_node_dns
+    setup_rhel_node_prereqs    # no-op for Ubuntu
     setup_squid_proxy
     setup_node_proxy
 
@@ -5394,12 +5689,12 @@ cmd_show_nodes() {
 
         echo -e "\n${BOLD}Controllers:${RESET}"
         echo "${controller_ips}" | while read -r ip; do
-            echo "  ${ip}   ssh -i ${ssh_key} ubuntu@${ip}"
+            echo "  ${ip}   ssh -i ${ssh_key} $(node_ssh_user)@${ip}"
         done
 
         echo -e "\n${BOLD}Workers:${RESET}"
         echo "${worker_ips}" | while read -r ip; do
-            echo "  ${ip}   ssh -i ${ssh_key} ubuntu@${ip}"
+            echo "  ${ip}   ssh -i ${ssh_key} $(node_ssh_user)@${ip}"
         done
     fi
 
