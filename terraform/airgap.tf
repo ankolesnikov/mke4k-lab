@@ -37,7 +37,7 @@ resource "aws_route_table_association" "airgap_private" {
 # --- Bastion/registry host (public subnet, internet access) ---
 resource "aws_instance" "bastion" {
   count                  = var.airgap_enabled ? 1 : 0
-  ami                    = data.aws_ami.ubuntu.id
+  ami                    = data.aws_ami.bastion.id
   instance_type          = var.airgap_registry_flavor
   key_name               = aws_key_pair.cluster.key_name
   vpc_security_group_ids = [aws_security_group.cluster_allow_ssh.id]

@@ -100,7 +100,8 @@ Edit `config` before deploying. Key variables:
 | `worker_flavor` | `m5a.large` | Worker instance type |
 | `region` | `eu-central-1` | |
 | `mke4k_version` | `v4.2.0` | mkectl is auto-downloaded at this version |
-| `os_distro` | `ubuntu-22.04` | `ubuntu-22.04` or `ubuntu-24.04` |
+| `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu). SSH user: `ubuntu`/`ec2-user`. Legacy `os_distro` still accepted with a warning |
+| `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn, AMI lookup may fail) |
 | `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap (no AWS API access) |
 | `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
@@ -125,12 +126,14 @@ Edit `config` before deploying. Key variables:
 1. `t deploy lab airgap` sources `config` → writes tfvars with `airgap_enabled=true`
 2. `terraform apply` provisions: dedicated VPC (172.31.0.0/16), public subnet (172.31.0.0/24) + private subnet (172.31.1.0/24), bastion EC2 in public subnet, controller/worker EC2s in private subnet (no internet), **internal** NLB in private subnet with IP-type target groups
 3. `setup_registry`: installs MCR (docker-ee) + bind9 + MSR4 (Harbor) on bastion; generates self-signed TLS cert (SAN=registry FQDN + bastion IP); creates Harbor project `mke`
-4. `ensure_mkectl_on_bastion`: installs mkectl + kubectl on bastion (moved before bundle upload so mkectl is available for dual-path mode)
-5. `upload_mke4k_bundle`: downloads MKE4k OCI bundle on bastion, uploads all images/charts to Harbor via containerised skopeo (`quay.io/skopeo/stable:v1.18.0`). Supports `standard` (filesystem scan) and `dual-path` (v4.1.3 workaround) modes
-6. `setup_node_dns`: configures each cluster node's systemd-resolved → bastion bind9 + `/etc/hosts` fallback for registry hostname
-7. `generate_mke4_yaml true`: uses private IPs, bastion keypath, embeds registry CA via `caData`, sets `airgap.enabled=true`, forces `cloudProvider.enabled=false`
-8. `mkectl_apply_on_bastion`: SCPs mke4.yaml + SSH key to bastion, runs `mkectl apply` there, retrieves kubeconfig
-9. `prompt_mke4k_upgrade_prep_airgap`: interactive prompt to prepare MKE4k → MKE4k airgap upgrade (uploads target version bundle, downloads release-matrix.json, prints upgrade command)
+4. `setup_node_dns`: configures each cluster node's resolver → bastion bind9 + `/etc/hosts` fallback for registry hostname (systemd-resolved on Ubuntu; NetworkManager `dns=none` + direct /etc/resolv.conf on RHEL). Runs early so RHEL dnf-via-Squid can resolve RHUI
+5. `setup_rhel_node_prereqs` (RHEL nodes only): disables nm-cloud-setup (+reboot — k0s incompatibility), disables firewalld/nftables; SELinux stays enforcing for MKE 4.1.3+ (supported), permissive for older target versions
+6. `ensure_mkectl_on_bastion`: installs mkectl + kubectl on bastion (moved before bundle upload so mkectl is available for dual-path mode)
+7. `upload_mke4k_bundle`: downloads MKE4k OCI bundle on bastion, uploads all images/charts to Harbor via containerised skopeo (`quay.io/skopeo/stable:v1.18.0`). Supports `standard` (filesystem scan) and `dual-path` (v4.1.3 workaround) modes
+8. NFS (when enabled): `install_nfs_client_on_nodes` — Ubuntu nodes get `.deb`s bundled on the bastion; RHEL nodes install `nfs-utils` via dnf through a bastion Squid proxy against RHUI (transient `--setopt=proxy=`, no persistent proxy state)
+9. `generate_mke4_yaml true`: uses private IPs, bastion keypath, embeds registry CA via `caData`, sets `airgap.enabled=true`, forces `cloudProvider.enabled=false`
+10. `mkectl_apply_on_bastion`: SCPs mke4.yaml + SSH key to bastion, runs `mkectl apply` there, retrieves kubeconfig
+11. `prompt_mke4k_upgrade_prep_airgap`: interactive prompt to prepare MKE4k → MKE4k airgap upgrade (uploads target version bundle, downloads release-matrix.json, prints upgrade command)
 
 ### Deploy flow (MKE3 airgap)
 
@@ -138,13 +141,14 @@ Edit `config` before deploying. Key variables:
 2. `terraform apply` provisions: dedicated VPC, public subnet (bastion) + private subnet (cluster nodes, no internet), both MKE4k and MKE3 NLBs (both internal in private subnet)
 3. `setup_registry`: installs MCR + bind9 + MSR4 (Harbor) on bastion (reused from MKE4k airgap)
 4. `upload_mke3_images`: downloads `ucp_images_<version>.tar.gz` on bastion, `docker load` + retag + push to Harbor `mke3` project
-5. `setup_node_dns`: configures cluster nodes' systemd-resolved → bastion bind9 (reused)
-6. `setup_squid_proxy`: installs Squid forward proxy on bastion (port 3128), ACL allows only private subnet to Mirantis/Docker/Ubuntu domains
-7. `setup_node_proxy`: configures each cluster node with APT proxy, environment proxy vars, sudoers env_keep, and Docker registry CA cert
-8. `ensure_launchpad_on_bastion`: installs launchpad binary on bastion
-9. `generate_launchpad_yaml true`: uses private IPs, bastion keypath, sets `imageRepo` to Harbor `mke3` project
-10. `launchpad_apply_on_bastion`: SCPs launchpad.yaml + SSH key to bastion, runs `launchpad apply` there
-11. Post-deploy: prompts for MKE3 → MKE4k upgrade preparation (uploads MKE4k bundle + generates mke4.yaml on bastion)
+5. `setup_node_dns`: configures cluster nodes' resolver → bastion bind9 (reused; systemd-resolved on Ubuntu, NetworkManager `dns=none` + /etc/resolv.conf on RHEL)
+6. `setup_rhel_node_prereqs` (RHEL only): disables nm-cloud-setup (+reboot), disables firewalld; SELinux enforcing kept on MKE 4.1.3+
+7. `setup_squid_proxy`: installs Squid forward proxy on bastion (port 3128), ACL allows only private subnet to Mirantis/Docker/Ubuntu/RedHat(RHUI) domains
+8. `setup_node_proxy`: configures each cluster node with apt (Ubuntu) or dnf (RHEL) proxy, environment proxy vars, sudoers env_keep, and Docker registry CA cert
+9. `ensure_launchpad_on_bastion`: installs launchpad binary on bastion
+10. `generate_launchpad_yaml true`: uses private IPs, bastion keypath, sets `imageRepo` to Harbor `mke3` project
+11. `launchpad_apply_on_bastion`: SCPs launchpad.yaml + SSH key to bastion, runs `launchpad apply` there
+12. Post-deploy: prompts for MKE3 → MKE4k upgrade preparation (uploads MKE4k bundle + generates mke4.yaml on bastion)
 
 ### Key files
 
@@ -153,7 +157,7 @@ Edit `config` before deploying. Key variables:
 - **`bin/t-commandline.bash`** — all CLI logic: config loading, tfvars generation, mkectl download, mke4.yaml generation, SSH helpers, deploy summary
 - **`bin/cleanup-aws.sh`** — emergency AWS cleanup when Terraform state is lost; finds resources by cluster tag, interactive confirmation
 - **`terraform/vpc.tf`** — dedicated VPC (172.31.0.0/16), internet gateway, public subnet (172.31.0.0/24), route table
-- **`terraform/main.tf`** — provider config, keypair, AMI lookup (Canonical owner ID), security group
+- **`terraform/main.tf`** — provider config, keypair, AMI lookups (`node` = ubuntu/redhat per `os_name`/`os_version`, `bastion` = always Ubuntu), security group
 - **`terraform/controller.tf` / `worker.tf`** — EC2 instances (public subnet normally, private subnet in airgap)
 - **`terraform/loadbalancer.tf`** — NLB + IP-type target groups + listeners; internal NLB in private subnet when airgap
 - **`terraform/airgap.tf`** — private subnet (172.31.1.0/24), route table (no IGW), bastion EC2 in public subnet; gated by `airgap_enabled`
@@ -182,10 +186,11 @@ Edit `config` before deploying. Key variables:
 - **IP-type target groups**: NLB target groups use `target_type = "ip"` (not instance). This is critical for `controller+worker` nodes where the kubelet bootstraps through the NLB back to itself (hairpin routing). AWS NLBs do not support hairpin with instance-type targets
 - **Internal NLB for airgap**: When `airgap_enabled`, the NLB is placed in the private subnet as an internal LB. Cluster nodes resolve it via VPC DNS (forwarded through bastion's bind9)
 - **CCM auto-disabled in airgap**: The AWS cloud controller manager requires access to `ec2.amazonaws.com` which is unreachable from the private subnet. `generate_mke4_yaml` forces `cloudProvider.enabled=false` when airgap=true
-- **DNS chain (airgap)**: cluster node → systemd-resolved → bastion bind9 → VPC DNS (172.31.0.2). Registry hostname (`registry.<cluster>.local`) is served by bind9; all other queries forwarded to VPC DNS. `/etc/hosts` fallback on all nodes for the registry hostname
+- **DNS chain (airgap)**: cluster node → local resolver → bastion bind9 → VPC DNS (172.31.0.2). Ubuntu: systemd-resolved. RHEL: NetworkManager gets `dns=none` and /etc/resolv.conf points directly at the bastion (survives DHCP renewals/reboots). Registry hostname (`registry.<cluster>.local`) is served by bind9; all other queries forwarded to VPC DNS. `/etc/hosts` fallback on all nodes for the registry hostname
 - **Registry TLS**: Self-signed cert with SAN covering both FQDN and bastion IP. CA embedded as `caData` in mke4.yaml; mkectl configures containerd trust on each node. Bastion has cert in `/etc/docker/certs.d/` for both FQDN and IP
 - **Bundle upload**: Containerised skopeo (`quay.io/skopeo/stable:v1.18.0`) with `--add-host` for DNS resolution inside the container. Filenames decoded: `&` → `/`, `@` → `:`. Two modes: `standard` (filesystem scan, default) and `dual-path` (v4.1.3 workaround — uses `mkectl airgap list-images/list-charts` to enumerate artifacts, uploads `registry.mirantis.com/mke/*` images to both `<registry>/mke/<path>` and `<registry>/mke/mke/<path>` to work around mkectl v4.1.3's double-prefix bug)
 - **mkectl v4.1.3 dual-path workaround**: `mkectl upgrade` v4.1.3 double-prefixes multi-level image names during artifact presence check (e.g. `mke/mke/calico/apiserver` instead of `mke/calico/apiserver`). Workaround: upload images to both paths. Automatically activated when target version is v4.1.3 (for fresh installs and upgrade prep)
-- **Squid proxy (MKE3 airgap)**: Forward proxy on bastion port 3128. Cluster nodes use it for MCR APT package install (`get.mirantis.com`, `repos.mirantis.com`). ACL restricts to Mirantis/Docker/Ubuntu domains only. CONNECT tunnelling for HTTPS — no SSL bump
+- **Squid proxy (MKE3 airgap; also RHEL nodes in MKE4k airgap)**: Forward proxy on bastion port 3128. Cluster nodes use it for MCR apt/dnf package install (`get.mirantis.com`, `repos.mirantis.com`); RHEL nodes also reach RHUI (`rhui.<region>.aws.ce.redhat.com`) through it for OS packages (container-selinux deps, nfs-utils). ACL restricts to Mirantis/Docker/Ubuntu/RedHat/CloudFront domains only. CONNECT tunnelling for HTTPS — no SSL bump
+- **RHEL cluster nodes** (`os_name=redhat`): official Red Hat PAYG AMIs (owner 309956199498), SSH user `ec2-user`. `setup_rhel_node_prereqs` disables nm-cloud-setup (documented k0s incompatibility, requires reboot) and firewalld; SELinux is left enforcing when `mke4k_version` ≥ 4.1.3 (SELinux supported since then), set permissive for older targets. Bastion/NFS server stay Ubuntu; RHEL OS packages come from RHUI via Squid (MKE4k airgap uses a transient per-command dnf proxy so nodes keep no proxy state)
 - **MKE3 image path (airgap)**: `docker load` from tarball → retag `mirantis/*` → push to `registry.<cluster>.local/mke3/*`. Nodes pull via Docker with `/etc/docker/certs.d/<registry>/ca.crt` trust
 - **MKE3 NLB airgap-aware**: When `airgap_enabled`, MKE3 NLB is internal in private subnet (same as MKE4k NLB)

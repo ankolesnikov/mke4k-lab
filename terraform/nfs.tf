@@ -4,7 +4,7 @@
 
 resource "aws_instance" "nfs_server" {
   count                  = var.nfs_enabled ? 1 : 0
-  ami                    = data.aws_ami.ubuntu.id
+  ami                    = data.aws_ami.bastion.id
   instance_type          = var.nfs_flavor
   key_name               = aws_key_pair.cluster.key_name
   vpc_security_group_ids = [aws_security_group.cluster_allow_ssh.id]

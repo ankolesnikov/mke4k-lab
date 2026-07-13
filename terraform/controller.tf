@@ -1,6 +1,6 @@
 resource "aws_instance" "cluster-controller" {
   count                  = var.controller_count
-  ami                    = data.aws_ami.ubuntu.id
+  ami                    = data.aws_ami.node.id
   instance_type          = var.controller_flavor
   key_name               = aws_key_pair.cluster.key_name
   iam_instance_profile   = var.ccm_enabled ? aws_iam_instance_profile.mke4k_ccm[0].name : null

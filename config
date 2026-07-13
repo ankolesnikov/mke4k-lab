@@ -99,8 +99,13 @@ airgap_msr_version="v4.13.3"
 controller_flavor="m5a.xlarge"
 worker_flavor="m5a.large"
 
-# Ubuntu version for all nodes: ubuntu-22.04 | ubuntu-24.04
-os_distro="ubuntu-22.04"
+# Cluster node OS (controllers/workers). Bastion and NFS server always run Ubuntu.
+# os_name:    ubuntu | redhat
+# os_version: MKE4-supported combos - ubuntu: 22.04, 24.04 | redhat: 9.6, 8.10
+#             (other versions are allowed with a warning; the AWS AMI lookup
+#              fails cleanly if no matching image exists)
+os_name="ubuntu"
+os_version="22.04"
 
 # AWS Cloud Controller Manager.
 # true  -> IAM role + policy; required for LoadBalancer services and EBS volumes.

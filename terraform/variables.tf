@@ -39,13 +39,23 @@ variable "ccm_enabled" {
   description = "Create IAM role/profile for AWS CCM and enable cloudProvider in mke4.yaml"
 }
 
-variable "os_distro" {
+variable "os_name" {
   type        = string
-  default     = "ubuntu-22.04"
-  description = "OS distribution: ubuntu-22.04 or ubuntu-24.04"
+  default     = "ubuntu"
+  description = "Cluster node OS: ubuntu or redhat (bastion/NFS server always run Ubuntu)"
   validation {
-    condition     = contains(["ubuntu-22.04", "ubuntu-24.04"], var.os_distro)
-    error_message = "os_distro must be 'ubuntu-22.04' or 'ubuntu-24.04'."
+    condition     = contains(["ubuntu", "redhat"], var.os_name)
+    error_message = "os_name must be 'ubuntu' or 'redhat'."
+  }
+}
+
+variable "os_version" {
+  type        = string
+  default     = "22.04"
+  description = "Cluster node OS version, e.g. 22.04/24.04 (ubuntu) or 9.6/8.10 (redhat)"
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+$", var.os_version))
+    error_message = "os_version must look like '22.04' or '9.6'."
   }
 }
 

@@ -44,25 +44,54 @@ resource "local_file" "ssh_private_key" {
 # AMI lookup
 # ---------------------------------------------------------------------------
 locals {
-  ami_filters = {
-    "ubuntu-22.04" = {
-      name  = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+  # Version-templated AMI name patterns per OS family.
+  # ubuntu: hvm-ssd* covers both hvm-ssd (22.04) and hvm-ssd-gp3 (24.04) schemes.
+  # redhat: official PAYG images (Hourly2 = hourly billing, excludes BYOS Access2).
+  ami_templates = {
+    ubuntu = {
+      name  = "ubuntu/images/hvm-ssd*/ubuntu-*-${var.os_version}-amd64-server-*"
       owner = "099720109477" # Canonical
     }
-    "ubuntu-24.04" = {
-      name  = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
-      owner = "099720109477" # Canonical
+    redhat = {
+      name  = "RHEL-${var.os_version}*_HVM-*-x86_64-*-Hourly2-GP3"
+      owner = "309956199498" # Red Hat
     }
   }
+  # Bastion + NFS server are always Ubuntu: follow os_version when the cluster
+  # nodes are Ubuntu, pin to 22.04 otherwise.
+  # NOTE: keep in sync with bastion_os_version() in bin/t-commandline.bash.
+  bastion_os_version = var.os_name == "ubuntu" ? var.os_version : "22.04"
 }
 
-data "aws_ami" "ubuntu" {
+# Cluster nodes (controllers/workers)
+data "aws_ami" "node" {
   most_recent = true
-  owners      = [local.ami_filters[var.os_distro].owner]
+  owners      = [local.ami_templates[var.os_name].owner]
 
   filter {
     name   = "name"
-    values = [local.ami_filters[var.os_distro].name]
+    values = [local.ami_templates[var.os_name].name]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+# Bastion + NFS server (always Ubuntu)
+data "aws_ami" "bastion" {
+  most_recent = true
+  owners      = [local.ami_templates["ubuntu"].owner]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd*/ubuntu-*-${local.bastion_os_version}-amd64-server-*"]
   }
 
   filter {
