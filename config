@@ -101,7 +101,7 @@ worker_flavor="m5a.large"
 
 # Cluster node OS (controllers/workers). Bastion and NFS server always run Ubuntu.
 # os_name:    ubuntu | redhat
-# os_version: MKE4-supported combos — ubuntu: 22.04, 24.04 | redhat: 9.6, 8.10
+# os_version: MKE4-supported combos - ubuntu: 22.04, 24.04 | redhat: 9.6, 8.10
 #             (other versions are allowed with a warning; the AWS AMI lookup
 #              fails cleanly if no matching image exists)
 os_name="ubuntu"
