@@ -102,7 +102,7 @@ Edit `config` before deploying. Key variables:
 | `mke4k_version` | `v4.2.0` | mkectl is auto-downloaded at this version |
 | `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu). SSH user: `ubuntu`/`ec2-user`. Legacy `os_distro` still accepted with a warning |
 | `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn, AMI lookup may fail) |
-| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap (no AWS API access) |
+| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. MKE4k: enables `cloudProvider` in mke4.yaml; MKE3: adds `--cloud-provider=aws` install flag. Auto-disabled in airgap (no AWS API access) |
 | `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
 | `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |

@@ -2128,6 +2128,13 @@ EOF
         info "Added --calico-datastore-type-kdd (mke3_version ${mke3_version} >= 3.7.12)"
     fi
 
+    # AWS cloud provider — nodes carry the CCM IAM instance profile when ccm_enabled.
+    # Skipped in airgap: no IAM profile is attached and AWS APIs are unreachable
+    if [[ "${ccm_enabled}" == "true" && "${airgap}" != "true" ]]; then
+        yq e -i '.spec.mke.installFlags += ["--cloud-provider=aws"]' "${launchpad_yaml}"
+        info "Added --cloud-provider=aws (ccm_enabled=true)"
+    fi
+
     # Airgap-specific patches: imageRepo → Harbor
     if [[ "${airgap}" == "true" ]]; then
         local reg_host="${registry_hostname}"

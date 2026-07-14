@@ -109,7 +109,10 @@ os_version="22.04"
 
 # AWS Cloud Controller Manager.
 # true  -> IAM role + policy; required for LoadBalancer services and EBS volumes.
+#          MKE4k: enables cloudProvider in mke4.yaml.
+#          MKE3: adds --cloud-provider=aws install flag to launchpad.yaml.
 # false -> no IAM resources; cloudProvider disabled.
+# (Forced off in airgap modes - no AWS API access from the private subnet.)
 ccm_enabled=false
 
 # true -> mkectl runs with -l debug (very verbose).
