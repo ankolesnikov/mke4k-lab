@@ -2086,14 +2086,20 @@ generate_launchpad_yaml() {
         --arg user "$(node_ssh_user)" \
         --arg ctrl_field "${ctrl_ips_field}" \
         --arg wkr_field "${wkr_ips_field}" \
-        '[
+        'def mcr_cfg: {
+            debug: true,
+            "log-opts": { "max-size": "100m", "max-file": "3" }
+        };
+        [
             (.[$ctrl_field].value[] | {
                 role: "manager",
-                ssh: { address: ., user: $user, keyPath: $key }
+                ssh: { address: ., user: $user, keyPath: $key },
+                mcrConfig: mcr_cfg
             }),
             (.[$wkr_field].value[] | {
                 role: "worker",
-                ssh: { address: ., user: $user, keyPath: $key }
+                ssh: { address: ., user: $user, keyPath: $key },
+                mcrConfig: mcr_cfg
             })
         ]')"
 
