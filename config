@@ -11,8 +11,10 @@
 #  1. Basic setup
 # ============================================================
 
-# Name prefix for all AWS resources. Leave as "mke4k-lab" to get a unique
-# random suffix (e.g. mke4k-lab-a3f2).
+# Name prefix for all AWS resources. Leave as "mke4k-lab" and the first
+# 't deploy lab|instances' will ask for your name (-> mke4k-lab-<name> and
+# an Owner tag on every resource, persisted in .cluster-id / .owner).
+# Non-interactive runs get a random suffix instead (e.g. mke4k-lab-a3f2).
 cluster_name="mke4k-lab"
 
 # AWS region to deploy into. Must match your credentials' scope.

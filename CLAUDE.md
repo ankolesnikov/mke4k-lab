@@ -94,7 +94,7 @@ Edit `config` before deploying. Key variables:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `cluster_name` | `mke4k-lab` | Name prefix for all AWS resources. Left as default, a random 4-char suffix is auto-appended (e.g. `mke4k-lab-a3f2`) to avoid collisions. Persisted in `.cluster-id` |
+| `cluster_name` | `mke4k-lab` | Name prefix for all AWS resources. Left as default, the first `t deploy lab\|instances` prompts for the user's name (interactive TTY only) → `mke4k-lab-<name>` + `Owner` tag on all resources (provider `default_tags`); non-interactive runs fall back to a random 4-char suffix (e.g. `mke4k-lab-a3f2`). Persisted in `.cluster-id` / `.owner` |
 | `controller_count` | `1` | Use 3 for HA (must be odd) |
 | `worker_count` | `1` | |
 | `controller_flavor` | `m5a.xlarge` | Controller instance type (4 vCPU / 16 GB min recommended) |

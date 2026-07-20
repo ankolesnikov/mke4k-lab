@@ -14,6 +14,11 @@ terraform {
 
 provider "aws" {
   region = var.region
+
+  # Owner tag on every resource so cloud admins can attribute them
+  default_tags {
+    tags = var.owner == "" ? {} : { Owner = var.owner }
+  }
 }
 
 # ---------------------------------------------------------------------------

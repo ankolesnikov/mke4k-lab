@@ -31,6 +31,18 @@ die()     { error "$*"; exit 1; }
 # version_gte <a> <b> — returns 0 (true) if version a >= b
 version_gte() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
 
+# Sanitize a user-typed name for use in AWS resource names: lowercase
+# a-z/0-9/hyphen only, max 10 chars. AWS caps NLB/target-group names at 32
+# chars and the longest generated name is <cluster_name>-mke3-nlb-sg (+12),
+# so cluster_name must stay ≤ 20 chars → "mke4k-lab-" leaves 10 for the name.
+sanitize_owner_name() {
+    printf '%s' "${1}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -cd 'a-z0-9-' \
+        | head -c 10 \
+        | sed 's/^-*//; s/-*$//'
+}
+
 # ---------------------------------------------------------------------------
 # Deploy phase timers
 # ---------------------------------------------------------------------------
@@ -73,17 +85,39 @@ load_config() {
 
     # Auto-generate a unique suffix when cluster_name is the bare default.
     # This prevents resource collisions when multiple people deploy simultaneously.
+    # Resource-creating commands (t deploy lab|instances, via _T_ASK_NAME) first
+    # ask for the user's name so both the user and the cloud admin can identify
+    # the resources (mke4k-lab-<name> prefix + Owner tag). Non-interactive runs
+    # and all other commands fall back to a random 4-char suffix.
     # The suffix is persisted in .cluster-id so it stays consistent across commands.
     if [[ "${cluster_name}" == "mke4k-lab" ]]; then
         local id_file="${PROJECT_ROOT}/.cluster-id"
         if [[ ! -f "${id_file}" ]]; then
-            local suffix
-            suffix="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)"
+            local suffix=""
+            if [[ "${_T_ASK_NAME:-false}" == "true" && -t 0 ]]; then
+                echo ""
+                echo -e "${BOLD}Please type your name so that you and the cloud admin can identify your AWS resources.${RESET}"
+                local raw_name=""
+                read -r -p "  Name (a-z, 0-9, max 10 chars; empty = random ID): " raw_name || true
+                suffix="$(sanitize_owner_name "${raw_name}")"
+                if [[ -n "${suffix}" ]]; then
+                    [[ "${suffix}" != "${raw_name}" ]] && warn "Name sanitised to '${suffix}'."
+                    echo "${suffix}" > "${PROJECT_ROOT}/.owner"
+                elif [[ -n "${raw_name}" ]]; then
+                    warn "Name '${raw_name}' has no usable characters — using a random ID instead."
+                fi
+            fi
+            if [[ -z "${suffix}" ]]; then
+                suffix="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)"
+            fi
             echo "${suffix}" > "${id_file}"
-            info "Generated cluster ID: mke4k-lab-${suffix} (saved to .cluster-id)"
+            info "Cluster name: mke4k-lab-${suffix} (saved to .cluster-id)"
         fi
         cluster_name="mke4k-lab-$(cat "${id_file}")"
     fi
+
+    # Owner name (set by the deploy-time prompt) → Owner tag on all AWS resources
+    lab_owner="$(cat "${PROJECT_ROOT}/.owner" 2>/dev/null || true)"
 
     # Validate required variables
     : "${cluster_name:?cluster_name not set in config}"
@@ -208,6 +242,7 @@ write_tfvars() {
     [[ "${airgap_enabled}" == "true" ]] && effective_ccm=false
     cat > "${TERRAFORM_DIR}/terraform.tfvars" <<EOF
 cluster_name             = "${cluster_name}"
+owner                    = "${lab_owner:-}"
 controller_count         = ${controller_count}
 worker_count             = ${worker_count}
 controller_flavor        = "${controller_flavor}"
@@ -6124,6 +6159,7 @@ case "${COMMAND}" in
     deploy)
         case "${SUBCOMMAND}" in
             lab)
+                _T_ASK_NAME=true
                 case "${3:-mke4}" in
                     mke4)        cmd_deploy_lab_mke4 ;;
                     mke3)        cmd_deploy_lab_mke3 ;;
@@ -6133,6 +6169,7 @@ case "${COMMAND}" in
                 esac
                 ;;
             instances)
+                _T_ASK_NAME=true
                 case "${3:-mke4}" in
                     mke4)        cmd_deploy_instances ;;
                     mke3)        cmd_deploy_instances_mke3 ;;
