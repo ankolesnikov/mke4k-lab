@@ -63,6 +63,7 @@ t deploy kof [full|lean] airgap # Deploy KOF from the bastion (charts/images fro
 t destroy kof                   # helm uninstall + delete ns kof (auto-detects airgap)
 
 # Common
+t deploy nfs [mke3]       # NFS server + provisioner on an existing cluster (auto-detects airgap)
 t status                  # kubectl get nodes
 t show nodes              # Print IPs + NLB DNS
 t connect m1              # SSH into controller-1 (m1/m2/m3 or w1/w2/w3)
@@ -103,7 +104,7 @@ Edit `config` before deploying. Key variables:
 | `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu). SSH user: `ubuntu`/`ec2-user`. Legacy `os_distro` still accepted with a warning |
 | `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn, AMI lookup may fail) |
 | `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. MKE4k: enables `cloudProvider` in mke4.yaml; MKE3: adds `--cloud-provider=aws` install flag. Auto-disabled in airgap (no AWS API access) |
-| `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA) |
+| `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA). Works in all modes incl. MKE3: MKE3 kubeconfig comes from the launchpad client bundle (`source env.sh`) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
 | `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |
 | `kof_mode` | `lean` | KOF scope: `full` (observability + FinOps) or `lean` (cluster monitoring only). Grafana + HTTPS gateway and MKE-monitoring reuse are on by default (advanced settings) |
@@ -148,7 +149,8 @@ Edit `config` before deploying. Key variables:
 9. `ensure_launchpad_on_bastion`: installs launchpad binary on bastion
 10. `generate_launchpad_yaml true`: uses private IPs, bastion keypath, sets `imageRepo` to Harbor `mke3` project
 11. `launchpad_apply_on_bastion`: SCPs launchpad.yaml + SSH key to bastion, runs `launchpad apply` there
-12. Post-deploy: prompts for MKE3 → MKE4k upgrade preparation (uploads MKE4k bundle + generates mke4.yaml on bastion)
+12. NFS (when enabled): `setup_nfs_server` + `install_nfs_client_on_nodes` (reused), then `upload_nfs_provisioner_image` + `deploy_nfs_provisioner_mke3_airgap` — generates the launchpad client bundle on the bastion, `source env.sh` for kubeconfig, helm-installs the provisioner from the pre-pulled chart
+13. Post-deploy: prompts for MKE3 → MKE4k upgrade preparation (uploads MKE4k bundle + generates mke4.yaml on bastion)
 
 ### Key files
 
