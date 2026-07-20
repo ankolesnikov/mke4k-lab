@@ -1695,7 +1695,7 @@ install_nfs_client_on_nodes() {
                 fi
                 sudo dnf -y -q --setopt=proxy=http://${bastion_private_ip}:3128 install nfs-utils >/dev/null
                 echo 'nfs-utils installed'
-            "
+            " || die "nfs-utils install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     elif [[ "${is_airgap}" == "true" ]]; then
         # Ubuntu nodes: download .deb bundle on the (Ubuntu) bastion, push + dpkg -i
@@ -1732,7 +1732,8 @@ install_nfs_client_on_nodes() {
                 tar xzf nfs-client-debs.tar.gz
                 sudo dpkg -i --force-depends nfs-client-debs/*.deb 2>/dev/null || true
                 rm -rf nfs-client-debs nfs-client-debs.tar.gz
-            "
+                dpkg -l nfs-common 2>/dev/null | grep -q '^ii'
+            " || die "nfs-common install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     elif [[ "${os_name}" == "redhat" ]]; then
         for node_ip in "${all_ips[@]}"; do
@@ -1745,20 +1746,23 @@ install_nfs_client_on_nodes() {
                 fi
                 sudo dnf -y -q install nfs-utils >/dev/null
                 echo 'nfs-utils installed'
-            "
+            " || die "nfs-utils install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     else
         for node_ip in "${all_ips[@]}"; do
             info "  nfs-common → ${node_ip}"
+            # DPkg::Lock::Timeout: apt/dpkg locks may still be held by
+            # unattended-upgrades or the just-finished product install
             ssh_node "${ssh_key}" "${node_ip}" "
                 set -euo pipefail
                 if dpkg -l nfs-common 2>/dev/null | grep -q '^ii'; then
                     echo 'nfs-common already installed'
                     exit 0
                 fi
-                sudo apt-get update -qq
-                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common >/dev/null 2>&1
-            "
+                sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
+                sudo DEBIAN_FRONTEND=noninteractive \
+                    apt-get -o DPkg::Lock::Timeout=300 install -y -qq nfs-common
+            " || die "nfs-common install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     fi
     success "NFS client installed on all cluster nodes."
@@ -2684,16 +2688,18 @@ print_deploy_summary() {
     if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
         bline "$(printf '  %-12s %s' 'NFS' "${nfs_priv_ip} (${nfs_export_path})")"
     fi
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'     "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise' "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'MKE4k install' "$(fmt_duration ${_T_MKECTL})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'     "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'     "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise' "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'MKE4k install' "$(fmt_duration ${_T_MKECTL})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'     "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'         "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'         "$(fmt_duration ${total})")"
     sep
     bline "  Controllers"
     local i=1
@@ -2786,16 +2792,18 @@ print_mke3_deploy_summary() {
     bline "$(printf '  %-12s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
     bline "$(printf '  %-12s %s' 'MKE3' "${mke3_version}")"
     bline "$(printf '  %-12s %s' 'MCR' "${mcr_version} (${mcr_channel})")"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'MKE3 install'    "$(fmt_duration ${_T_LAUNCHPAD})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'MKE3 install'    "$(fmt_duration ${_T_LAUNCHPAD})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     sep
     bline "  Controllers"
     local i=1
@@ -2890,18 +2898,20 @@ print_airgap_deploy_summary() {
     bline "$(printf '  %-18s %s' 'Registry IP' "${bastion_priv_ip}")"
     bline "$(printf '  %-18s %s' 'Registry user' 'admin')"
     bline "$(printf '  %-18s %s' 'Registry password' "${registry_pass}")"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
-    bline "$(printf '    %-22s %s' 'Bundle upload'   "$(fmt_duration ${_T_BUNDLE})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'mkectl apply'    "$(fmt_duration ${_T_MKECTL})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
+        bline "$(printf '    %-22s %s' 'Bundle upload'   "$(fmt_duration ${_T_BUNDLE})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'mkectl apply'    "$(fmt_duration ${_T_MKECTL})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     sep
     bline "  Controllers (private)"
     local i=1
@@ -3005,19 +3015,21 @@ print_mke3_airgap_deploy_summary() {
     bline "$(printf '    %-12s %s' 'Username' "${admin_user}")"
     bline "$(printf '    %-12s %s' 'Password' "${admin_pass}")"
     bline "  (saved to terraform/mke3_credentials.txt)"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
-    bline "$(printf '    %-22s %s' 'MKE3 images'     "$(fmt_duration ${_T_MKE3_IMAGES})")"
-    bline "$(printf '    %-22s %s' 'Proxy setup'     "$(fmt_duration ${_T_PROXY})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'launchpad apply'  "$(fmt_duration ${_T_LAUNCHPAD})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
+        bline "$(printf '    %-22s %s' 'MKE3 images'     "$(fmt_duration ${_T_MKE3_IMAGES})")"
+        bline "$(printf '    %-22s %s' 'Proxy setup'     "$(fmt_duration ${_T_PROXY})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'launchpad apply'  "$(fmt_duration ${_T_LAUNCHPAD})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     sep
     bline "  Controllers (private)"
     local i=1
@@ -5906,6 +5918,33 @@ cmd_show_nodes() {
     echo ""
 }
 
+# Reprint the deploy summary box on demand (e.g. after 't deploy nfs' finished
+# a lab that failed mid-deploy, or just to look up credentials/URLs again).
+# _T_* timers are all 0 outside a live deploy, so the Timing section is
+# skipped (each print_* function only renders it when _T_TERRAFORM > 0).
+cmd_show_summary() {
+    load_config
+    local output
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+
+    local bastion_ip mke3_lb_dns
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null)"
+    local is_airgap=false is_mke3=false
+    [[ -n "${bastion_ip}" ]] && is_airgap=true
+    [[ -n "${mke3_lb_dns}" ]] && is_mke3=true
+
+    if [[ "${is_mke3}" == "true" && "${is_airgap}" == "true" ]]; then
+        print_mke3_airgap_deploy_summary
+    elif [[ "${is_mke3}" == "true" ]]; then
+        print_mke3_deploy_summary
+    elif [[ "${is_airgap}" == "true" ]]; then
+        print_airgap_deploy_summary
+    else
+        print_deploy_summary
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Tunnel — SSH port-forward for airgap UIs
 # ---------------------------------------------------------------------------
@@ -6129,6 +6168,7 @@ usage() {
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
+    echo "  show summary                Reprint the deploy summary box (credentials, URLs, IPs)"
     echo "  connect bastion             SSH to bastion/registry host (airgap)"
     echo "  connect nfs                 SSH to NFS server (when nfs_enabled=true)"
     echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
@@ -6245,8 +6285,9 @@ case "${COMMAND}" in
     status)    cmd_status ;;
     show)
         case "${SUBCOMMAND}" in
-            nodes) cmd_show_nodes ;;
-            *)     die "Unknown subcommand: t show ${SUBCOMMAND}. Try: nodes" ;;
+            nodes)   cmd_show_nodes ;;
+            summary) cmd_show_summary ;;
+            *)       die "Unknown subcommand: t show ${SUBCOMMAND}. Try: nodes, summary" ;;
         esac
         ;;
     connect) cmd_connect "${SUBCOMMAND}" "${3:-}" ;;

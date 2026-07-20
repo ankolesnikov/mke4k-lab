@@ -66,6 +66,7 @@ t destroy kof                   # helm uninstall + delete ns kof (auto-detects a
 t deploy nfs [mke3]       # NFS server + provisioner on an existing cluster (auto-detects airgap)
 t status                  # kubectl get nodes
 t show nodes              # Print IPs + NLB DNS
+t show summary            # Reprint the deploy summary box (credentials, URLs, IPs)
 t connect m1              # SSH into controller-1 (m1/m2/m3 or w1/w2/w3)
 t connect m1 "cmd"        # Run a single command on a node
 
