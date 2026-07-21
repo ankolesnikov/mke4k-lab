@@ -31,6 +31,18 @@ die()     { error "$*"; exit 1; }
 # version_gte <a> <b> — returns 0 (true) if version a >= b
 version_gte() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
 
+# Sanitize a user-typed name for use in AWS resource names: lowercase
+# a-z/0-9/hyphen only, max 10 chars. AWS caps NLB/target-group names at 32
+# chars and the longest generated name is <cluster_name>-mke3-nlb-sg (+12),
+# so cluster_name must stay ≤ 20 chars → "mke4k-lab-" leaves 10 for the name.
+sanitize_owner_name() {
+    printf '%s' "${1}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -cd 'a-z0-9-' \
+        | head -c 10 \
+        | sed 's/^-*//; s/-*$//'
+}
+
 # ---------------------------------------------------------------------------
 # Deploy phase timers
 # ---------------------------------------------------------------------------
@@ -73,17 +85,39 @@ load_config() {
 
     # Auto-generate a unique suffix when cluster_name is the bare default.
     # This prevents resource collisions when multiple people deploy simultaneously.
+    # Resource-creating commands (t deploy lab|instances, via _T_ASK_NAME) first
+    # ask for the user's name so both the user and the cloud admin can identify
+    # the resources (mke4k-lab-<name> prefix + Owner tag). Non-interactive runs
+    # and all other commands fall back to a random 4-char suffix.
     # The suffix is persisted in .cluster-id so it stays consistent across commands.
     if [[ "${cluster_name}" == "mke4k-lab" ]]; then
         local id_file="${PROJECT_ROOT}/.cluster-id"
         if [[ ! -f "${id_file}" ]]; then
-            local suffix
-            suffix="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)"
+            local suffix=""
+            if [[ "${_T_ASK_NAME:-false}" == "true" && -t 0 ]]; then
+                echo ""
+                echo -e "${BOLD}Please type your name so that you and the cloud admin can identify your AWS resources.${RESET}"
+                local raw_name=""
+                read -r -p "  Name (a-z, 0-9, max 10 chars; empty = random ID): " raw_name || true
+                suffix="$(sanitize_owner_name "${raw_name}")"
+                if [[ -n "${suffix}" ]]; then
+                    [[ "${suffix}" != "${raw_name}" ]] && warn "Name sanitised to '${suffix}'."
+                    echo "${suffix}" > "${PROJECT_ROOT}/.owner"
+                elif [[ -n "${raw_name}" ]]; then
+                    warn "Name '${raw_name}' has no usable characters — using a random ID instead."
+                fi
+            fi
+            if [[ -z "${suffix}" ]]; then
+                suffix="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)"
+            fi
             echo "${suffix}" > "${id_file}"
-            info "Generated cluster ID: mke4k-lab-${suffix} (saved to .cluster-id)"
+            info "Cluster name: mke4k-lab-${suffix} (saved to .cluster-id)"
         fi
         cluster_name="mke4k-lab-$(cat "${id_file}")"
     fi
+
+    # Owner name (set by the deploy-time prompt) → Owner tag on all AWS resources
+    lab_owner="$(cat "${PROJECT_ROOT}/.owner" 2>/dev/null || true)"
 
     # Validate required variables
     : "${cluster_name:?cluster_name not set in config}"
@@ -208,6 +242,7 @@ write_tfvars() {
     [[ "${airgap_enabled}" == "true" ]] && effective_ccm=false
     cat > "${TERRAFORM_DIR}/terraform.tfvars" <<EOF
 cluster_name             = "${cluster_name}"
+owner                    = "${lab_owner:-}"
 controller_count         = ${controller_count}
 worker_count             = ${worker_count}
 controller_flavor        = "${controller_flavor}"
@@ -1409,6 +1444,23 @@ ensure_mkectl_on_bastion() {
             rm -f '${tarball}' mkectl
             echo 'mkectl ${want} installed'
         fi
+        if ! command -v k9s &>/dev/null; then
+            echo '>>> Installing k9s...'
+            curl -fsSL 'https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz' -o /tmp/k9s.tar.gz
+            tar -xzf /tmp/k9s.tar.gz -C /tmp k9s
+            sudo install -m 755 /tmp/k9s /usr/local/bin/k9s
+            rm -f /tmp/k9s.tar.gz /tmp/k9s
+            echo 'k9s installed'
+        else
+            echo 'k9s already installed'
+        fi
+    "
+    ensure_kubectl_on_bastion "${ssh_key}" "${bastion_ip}"
+}
+
+ensure_kubectl_on_bastion() {
+    local ssh_key="${1}" bastion_ip="${2}"
+    ssh_node "${ssh_key}" "${bastion_ip}" "
         if ! command -v kubectl &>/dev/null; then
             echo '>>> Installing kubectl...'
             curl -fsSL 'https://dl.k8s.io/release/stable.txt' -o /tmp/k8s_ver
@@ -1419,16 +1471,6 @@ ensure_mkectl_on_bastion() {
             echo \"kubectl \${K8S_VER} installed\"
         else
             echo 'kubectl already installed'
-        fi
-        if ! command -v k9s &>/dev/null; then
-            echo '>>> Installing k9s...'
-            curl -fsSL 'https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz' -o /tmp/k9s.tar.gz
-            tar -xzf /tmp/k9s.tar.gz -C /tmp k9s
-            sudo install -m 755 /tmp/k9s /usr/local/bin/k9s
-            rm -f /tmp/k9s.tar.gz /tmp/k9s
-            echo 'k9s installed'
-        else
-            echo 'k9s already installed'
         fi
     "
 }
@@ -1653,7 +1695,7 @@ install_nfs_client_on_nodes() {
                 fi
                 sudo dnf -y -q --setopt=proxy=http://${bastion_private_ip}:3128 install nfs-utils >/dev/null
                 echo 'nfs-utils installed'
-            "
+            " || die "nfs-utils install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     elif [[ "${is_airgap}" == "true" ]]; then
         # Ubuntu nodes: download .deb bundle on the (Ubuntu) bastion, push + dpkg -i
@@ -1690,7 +1732,8 @@ install_nfs_client_on_nodes() {
                 tar xzf nfs-client-debs.tar.gz
                 sudo dpkg -i --force-depends nfs-client-debs/*.deb 2>/dev/null || true
                 rm -rf nfs-client-debs nfs-client-debs.tar.gz
-            "
+                dpkg -l nfs-common 2>/dev/null | grep -q '^ii'
+            " || die "nfs-common install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     elif [[ "${os_name}" == "redhat" ]]; then
         for node_ip in "${all_ips[@]}"; do
@@ -1703,20 +1746,23 @@ install_nfs_client_on_nodes() {
                 fi
                 sudo dnf -y -q install nfs-utils >/dev/null
                 echo 'nfs-utils installed'
-            "
+            " || die "nfs-utils install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     else
         for node_ip in "${all_ips[@]}"; do
             info "  nfs-common → ${node_ip}"
+            # DPkg::Lock::Timeout: apt/dpkg locks may still be held by
+            # unattended-upgrades or the just-finished product install
             ssh_node "${ssh_key}" "${node_ip}" "
                 set -euo pipefail
                 if dpkg -l nfs-common 2>/dev/null | grep -q '^ii'; then
                     echo 'nfs-common already installed'
                     exit 0
                 fi
-                sudo apt-get update -qq
-                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common >/dev/null 2>&1
-            "
+                sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
+                sudo DEBIAN_FRONTEND=noninteractive \
+                    apt-get -o DPkg::Lock::Timeout=300 install -y -qq nfs-common
+            " || die "nfs-common install failed on ${node_ip} (see output above). The cluster itself is deployed — re-run 't deploy nfs [mke3]' to finish NFS setup."
         done
     fi
     success "NFS client installed on all cluster nodes."
@@ -1864,6 +1910,96 @@ deploy_nfs_provisioner_airgap() {
         echo 'NFS StorageClass nfs-client deployed and set as default'
     "
     success "NFS StorageClass 'nfs-client' deployed (airgap)."
+}
+
+# ---------------------------------------------------------------------------
+# MKE3 — kubectl/helm access goes through the launchpad client bundle
+# (source env.sh inside the bundle dir to set KUBECONFIG + certs)
+# ---------------------------------------------------------------------------
+# Generates (or refreshes) the MKE3 admin client bundle locally and prints
+# its directory on stdout. Status output goes to stderr so callers can
+# capture the path with $(...).
+ensure_mke3_client_bundle() {
+    local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
+    [[ -f "${launchpad_yaml}" ]] || die "launchpad.yaml not found. Deploy MKE3 first."
+    ensure_launchpad >&2
+    info "Generating MKE3 client bundle..." >&2
+    launchpad client-config -a -c "${launchpad_yaml}" >&2
+
+    local bundle_dir
+    bundle_dir="$(ls -d "${HOME}"/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1 || true)"
+    [[ -n "${bundle_dir}" ]] || die "Client bundle not found."
+    echo "${bundle_dir}"
+}
+
+deploy_nfs_provisioner_mke3() {
+    local bundle_dir
+    bundle_dir="$(ensure_mke3_client_bundle)"
+    info "Using MKE3 client bundle: ${bundle_dir}"
+    (
+        cd "${bundle_dir}"
+        set +u   # env.sh may reference unset vars
+        # shellcheck source=/dev/null
+        source env.sh
+        set -u
+        deploy_nfs_provisioner
+    )
+}
+
+deploy_nfs_provisioner_mke3_airgap() {
+    local output ssh_key bastion_ip nfs_private_ip
+    output="$(tf_output)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value')"
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value')"
+    nfs_private_ip="$(echo "${output}" | jq -r '.nfs_server_private_ip.value')"
+
+    [[ -z "${nfs_private_ip}" || "${nfs_private_ip}" == "null" || "${nfs_private_ip}" == "" ]] \
+        && die "NFS server private IP not found."
+
+    local reg_host="${registry_hostname}"
+
+    ensure_kubectl_on_bastion "${ssh_key}" "${bastion_ip}"
+
+    info "Deploying nfs-subdir-external-provisioner (MKE3 airgap, from bastion)..."
+
+    # No 'set -u': env.sh may reference unset vars
+    ssh_node "${ssh_key}" "${bastion_ip}" "
+        set -eo pipefail
+
+        command -v launchpad &>/dev/null || { echo 'ERROR: launchpad not found on bastion. Deploy MKE3 first.'; exit 1; }
+        [[ -f ~/launchpad.yaml ]] || { echo 'ERROR: launchpad.yaml not found on bastion. Deploy MKE3 first.'; exit 1; }
+
+        echo '>>> Generating MKE3 client bundle...'
+        launchpad client-config -a -c ~/launchpad.yaml
+        BUNDLE_DIR=\$(ls -d ~/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1 || true)
+        [[ -n \"\${BUNDLE_DIR}\" ]] || { echo 'ERROR: client bundle not found on bastion.'; exit 1; }
+        cd \"\${BUNDLE_DIR}\"
+        source env.sh
+
+        CHART_DIR=~/nfs-provisioner-chart/nfs-subdir-external-provisioner
+        [[ -d \"\${CHART_DIR}\" ]] || { echo 'ERROR: Chart not found. Run upload_nfs_provisioner_image first.'; exit 1; }
+
+        helm install nfs-subdir-external-provisioner \"\${CHART_DIR}\" \
+            --set nfs.server='${nfs_private_ip}' \
+            --set nfs.path='${nfs_export_path}' \
+            --set image.repository='${reg_host}/nfs/nfs-subdir-external-provisioner' \
+            --set image.tag='v4.0.2' \
+            --wait --timeout 300s 2>/dev/null \
+        || {
+            helm upgrade nfs-subdir-external-provisioner \"\${CHART_DIR}\" \
+                --set nfs.server='${nfs_private_ip}' \
+                --set nfs.path='${nfs_export_path}' \
+                --set image.repository='${reg_host}/nfs/nfs-subdir-external-provisioner' \
+                --set image.tag='v4.0.2' \
+                --wait --timeout 300s
+        }
+
+        kubectl patch storageclass nfs-client \
+            -p '{\"metadata\":{\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'
+
+        echo 'NFS StorageClass nfs-client deployed and set as default'
+    "
+    success "NFS StorageClass 'nfs-client' deployed (MKE3 airgap)."
 }
 
 # ---------------------------------------------------------------------------
@@ -2552,16 +2688,18 @@ print_deploy_summary() {
     if [[ -n "${nfs_priv_ip}" && "${nfs_priv_ip}" != "" ]]; then
         bline "$(printf '  %-12s %s' 'NFS' "${nfs_priv_ip} (${nfs_export_path})")"
     fi
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'     "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise' "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'MKE4k install' "$(fmt_duration ${_T_MKECTL})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'     "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'     "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise' "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'MKE4k install' "$(fmt_duration ${_T_MKECTL})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'     "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'         "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'         "$(fmt_duration ${total})")"
     sep
     bline "  Controllers"
     local i=1
@@ -2633,7 +2771,7 @@ print_mke3_deploy_summary() {
 
     local nodes_yaml="${TERRAFORM_DIR}/nodes.yaml"
 
-    local total=$(( _T_TERRAFORM + _T_NLB + _T_LAUNCHPAD ))
+    local total=$(( _T_TERRAFORM + _T_NLB + _T_LAUNCHPAD + _T_NFS ))
 
     local W=58
     local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
@@ -2654,13 +2792,18 @@ print_mke3_deploy_summary() {
     bline "$(printf '  %-12s %-20s %s' 'Cluster' "${cluster_name}" "${region}")"
     bline "$(printf '  %-12s %s' 'MKE3' "${mke3_version}")"
     bline "$(printf '  %-12s %s' 'MCR' "${mcr_version} (${mcr_channel})")"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'MKE3 install'    "$(fmt_duration ${_T_LAUNCHPAD})")"
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'MKE3 install'    "$(fmt_duration ${_T_LAUNCHPAD})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
+    fi
     sep
     bline "  Controllers"
     local i=1
@@ -2755,18 +2898,20 @@ print_airgap_deploy_summary() {
     bline "$(printf '  %-18s %s' 'Registry IP' "${bastion_priv_ip}")"
     bline "$(printf '  %-18s %s' 'Registry user' 'admin')"
     bline "$(printf '  %-18s %s' 'Registry password' "${registry_pass}")"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
-    bline "$(printf '    %-22s %s' 'Bundle upload'   "$(fmt_duration ${_T_BUNDLE})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'mkectl apply'    "$(fmt_duration ${_T_MKECTL})")"
-    if [[ ${_T_NFS} -gt 0 ]]; then
-        bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
+        bline "$(printf '    %-22s %s' 'Bundle upload'   "$(fmt_duration ${_T_BUNDLE})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'mkectl apply'    "$(fmt_duration ${_T_MKECTL})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     fi
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
     sep
     bline "  Controllers (private)"
     local i=1
@@ -2836,7 +2981,7 @@ print_mke3_airgap_deploy_summary() {
     local registry_pass
     registry_pass="$(grep '^password=' "${reg_creds_file}" 2>/dev/null | cut -d= -f2 || echo "(unknown)")"
 
-    local total=$(( _T_TERRAFORM + _T_REGISTRY + _T_MKE3_IMAGES + _T_PROXY + _T_NLB + _T_LAUNCHPAD ))
+    local total=$(( _T_TERRAFORM + _T_REGISTRY + _T_MKE3_IMAGES + _T_PROXY + _T_NLB + _T_LAUNCHPAD + _T_NFS ))
 
     local W=58
     local SEP; SEP="$(printf '═%.0s' $(seq 1 ${W}))"
@@ -2870,16 +3015,21 @@ print_mke3_airgap_deploy_summary() {
     bline "$(printf '    %-12s %s' 'Username' "${admin_user}")"
     bline "$(printf '    %-12s %s' 'Password' "${admin_pass}")"
     bline "  (saved to terraform/mke3_credentials.txt)"
-    sep
-    bline "  Timing"
-    bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
-    bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
-    bline "$(printf '    %-22s %s' 'MKE3 images'     "$(fmt_duration ${_T_MKE3_IMAGES})")"
-    bline "$(printf '    %-22s %s' 'Proxy setup'     "$(fmt_duration ${_T_PROXY})")"
-    bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
-    bline "$(printf '    %-22s %s' 'launchpad apply'  "$(fmt_duration ${_T_LAUNCHPAD})")"
-    bline "    ${HDIV}"
-    bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
+    if [[ ${_T_TERRAFORM} -gt 0 ]]; then
+        sep
+        bline "  Timing"
+        bline "$(printf '    %-22s %s' 'Terraform'       "$(fmt_duration ${_T_TERRAFORM})")"
+        bline "$(printf '    %-22s %s' 'Registry setup'  "$(fmt_duration ${_T_REGISTRY})")"
+        bline "$(printf '    %-22s %s' 'MKE3 images'     "$(fmt_duration ${_T_MKE3_IMAGES})")"
+        bline "$(printf '    %-22s %s' 'Proxy setup'     "$(fmt_duration ${_T_PROXY})")"
+        bline "$(printf '    %-22s %s' 'NLB stabilise'   "$(fmt_duration ${_T_NLB})")"
+        bline "$(printf '    %-22s %s' 'launchpad apply'  "$(fmt_duration ${_T_LAUNCHPAD})")"
+        if [[ ${_T_NFS} -gt 0 ]]; then
+            bline "$(printf '    %-22s %s' 'NFS setup'       "$(fmt_duration ${_T_NFS})")"
+        fi
+        bline "    ${HDIV}"
+        bline "$(printf '    %-22s %s' 'Total'           "$(fmt_duration ${total})")"
+    fi
     sep
     bline "  Controllers (private)"
     local i=1
@@ -2954,6 +3104,12 @@ cmd_deploy_lab_mke3() {
     generate_launchpad_yaml
     launchpad_apply
     timer_phase_end _T_LAUNCHPAD
+    if [[ "${nfs_enabled}" == "true" ]]; then
+        setup_nfs_server
+        install_nfs_client_on_nodes
+        deploy_nfs_provisioner_mke3
+        timer_phase_end _T_NFS
+    fi
     print_mke3_deploy_summary
     prompt_mkectl_for_upgrade
 }
@@ -3147,6 +3303,14 @@ cmd_deploy_lab_mke3_airgap() {
     launchpad_apply_on_bastion
     timer_phase_end _T_LAUNCHPAD
 
+    if [[ "${nfs_enabled}" == "true" ]]; then
+        setup_nfs_server
+        install_nfs_client_on_nodes
+        upload_nfs_provisioner_image
+        deploy_nfs_provisioner_mke3_airgap
+        timer_phase_end _T_NFS
+    fi
+
     print_mke3_airgap_deploy_summary
     prompt_upgrade_prep_airgap
 }
@@ -3200,6 +3364,7 @@ cmd_destroy_lab() {
 }
 
 cmd_deploy_nfs() {
+    local product="${1:-mke4}"   # mke4 | mke3
     load_config
     [[ "${nfs_enabled}" == "true" ]] || die "nfs_enabled is not true in config"
 
@@ -3215,7 +3380,13 @@ cmd_deploy_nfs() {
     install_nfs_client_on_nodes
     if [[ "${is_airgap}" == "true" ]]; then
         upload_nfs_provisioner_image
-        deploy_nfs_provisioner_airgap
+        if [[ "${product}" == "mke3" ]]; then
+            deploy_nfs_provisioner_mke3_airgap
+        else
+            deploy_nfs_provisioner_airgap
+        fi
+    elif [[ "${product}" == "mke3" ]]; then
+        deploy_nfs_provisioner_mke3
     else
         deploy_nfs_provisioner
     fi
@@ -5747,6 +5918,33 @@ cmd_show_nodes() {
     echo ""
 }
 
+# Reprint the deploy summary box on demand (e.g. after 't deploy nfs' finished
+# a lab that failed mid-deploy, or just to look up credentials/URLs again).
+# _T_* timers are all 0 outside a live deploy, so the Timing section is
+# skipped (each print_* function only renders it when _T_TERRAFORM > 0).
+cmd_show_summary() {
+    load_config
+    local output
+    output="$(tf_output 2>/dev/null)" || die "Could not read terraform output. Has terraform been applied?"
+
+    local bastion_ip mke3_lb_dns
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null)"
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null)"
+    local is_airgap=false is_mke3=false
+    [[ -n "${bastion_ip}" ]] && is_airgap=true
+    [[ -n "${mke3_lb_dns}" ]] && is_mke3=true
+
+    if [[ "${is_mke3}" == "true" && "${is_airgap}" == "true" ]]; then
+        print_mke3_airgap_deploy_summary
+    elif [[ "${is_mke3}" == "true" ]]; then
+        print_mke3_deploy_summary
+    elif [[ "${is_airgap}" == "true" ]]; then
+        print_airgap_deploy_summary
+    else
+        print_deploy_summary
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Tunnel — SSH port-forward for airgap UIs
 # ---------------------------------------------------------------------------
@@ -5901,8 +6099,6 @@ cmd_gen_client_bundle() {
     fi
 
     # MKE3 — generate client bundle
-    local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
-
     if [[ "${is_airgap}" == "true" ]]; then
         # Airgap: run on bastion
         info "Generating MKE3 client bundle on bastion (airgap)..."
@@ -5924,15 +6120,8 @@ cmd_gen_client_bundle() {
         echo ""
     else
         # Online: run locally
-        [[ -f "${launchpad_yaml}" ]] || die "launchpad.yaml not found. Deploy MKE3 first."
-        ensure_launchpad
-        info "Generating MKE3 client bundle..."
-        launchpad client-config -a -c "${launchpad_yaml}"
-
-        # Find the bundle directory
         local bundle_dir
-        bundle_dir="$(ls -d ${HOME}/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1)"
-        [[ -n "${bundle_dir}" ]] || die "Client bundle not found."
+        bundle_dir="$(ensure_mke3_client_bundle)"
 
         success "Client bundle downloaded to: ${bundle_dir}"
         echo ""
@@ -5964,7 +6153,7 @@ usage() {
     echo "  deploy cluster mke3-airgap  Install MKE3 from bastion (airgap + proxy)"
     echo "  deploy registry             Setup MSR4 + upload MKE4k bundle"
     echo "  deploy registry mke3        Setup MSR4 + upload MKE3 images"
-    echo "  deploy nfs                  Setup NFS server + CSI driver (cluster must exist)"
+    echo "  deploy nfs [mke3]           Setup NFS server + provisioner (cluster must exist)"
     echo "  deploy msr4                 Deploy MSR4 (Harbor) on existing cluster"
     echo "  deploy msr4 airgap          Deploy MSR4 via bastion Harbor registry"
     echo "  deploy kof [full|lean]      Deploy KOF observability/FinOps (self-monitoring; default kof_mode)"
@@ -5979,6 +6168,7 @@ usage() {
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
+    echo "  show summary                Reprint the deploy summary box (credentials, URLs, IPs)"
     echo "  connect bastion             SSH to bastion/registry host (airgap)"
     echo "  connect nfs                 SSH to NFS server (when nfs_enabled=true)"
     echo "  connect <node>              SSH into a node (m1/m2/m3, w1/w2/w3, or raw IP)"
@@ -6009,6 +6199,7 @@ case "${COMMAND}" in
     deploy)
         case "${SUBCOMMAND}" in
             lab)
+                _T_ASK_NAME=true
                 case "${3:-mke4}" in
                     mke4)        cmd_deploy_lab_mke4 ;;
                     mke3)        cmd_deploy_lab_mke3 ;;
@@ -6018,6 +6209,7 @@ case "${COMMAND}" in
                 esac
                 ;;
             instances)
+                _T_ASK_NAME=true
                 case "${3:-mke4}" in
                     mke4)        cmd_deploy_instances ;;
                     mke3)        cmd_deploy_instances_mke3 ;;
@@ -6042,7 +6234,13 @@ case "${COMMAND}" in
                     *)           die "Unknown variant: t deploy registry ${3}. Try: mke4, mke3" ;;
                 esac
                 ;;
-            nfs) cmd_deploy_nfs ;;
+            nfs)
+                case "${3:-mke4}" in
+                    mke4|"") cmd_deploy_nfs ;;
+                    mke3)    cmd_deploy_nfs mke3 ;;
+                    *)       die "Unknown variant: t deploy nfs ${3}. Try: mke4, mke3" ;;
+                esac
+                ;;
             msr4)
                 case "${3:-}" in
                     "")      cmd_deploy_msr4 ;;
@@ -6087,8 +6285,9 @@ case "${COMMAND}" in
     status)    cmd_status ;;
     show)
         case "${SUBCOMMAND}" in
-            nodes) cmd_show_nodes ;;
-            *)     die "Unknown subcommand: t show ${SUBCOMMAND}. Try: nodes" ;;
+            nodes)   cmd_show_nodes ;;
+            summary) cmd_show_summary ;;
+            *)       die "Unknown subcommand: t show ${SUBCOMMAND}. Try: nodes, summary" ;;
         esac
         ;;
     connect) cmd_connect "${SUBCOMMAND}" "${3:-}" ;;

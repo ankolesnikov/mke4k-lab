@@ -3,6 +3,12 @@ variable "cluster_name" {
   default = "mke4k-lab"
 }
 
+# Owner name for the Owner tag on all resources; empty = no tag
+variable "owner" {
+  type    = string
+  default = ""
+}
+
 variable "controller_count" {
   type    = number
   default = 1
