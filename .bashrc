@@ -64,3 +64,6 @@ complete -C /usr/local/bin/terraform terraform 2>/dev/null || true
 [[ -f "${HOME}/.mke/mke.kubeconf" ]] && export KUBECONFIG="${HOME}/.mke/mke.kubeconf"
 
 [[ -f /etc/motd ]] && cat /etc/motd
+
+# Show the local lab's expiry status without changing this shell's environment.
+t expiry status 2>/dev/null || true

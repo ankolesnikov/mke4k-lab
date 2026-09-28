@@ -33,6 +33,22 @@ docker run -it --name mke4k-lab \
 
 > The bastion's Harbor registry UI is reachable directly at `https://<bastion-public-ip>` (the bastion has a public IP and the SG opens 443), so no port mapping or tunnel is needed for it.
 
+To keep Terraform state, generated SSH keys, manifests, credentials, and client configuration on the host, run from a checkout of this repository with bind mounts:
+
+```bash
+LAB_DIR="$(pwd)"
+mkdir -p "${LAB_DIR}/.mke" "${LAB_DIR}/.mirantis-launchpad"
+docker run --rm -it \
+  -v "${LAB_DIR}:/mke4k-lab" \
+  -v "${LAB_DIR}/.mke:/root/.mke" \
+  -v "${LAB_DIR}/.mirantis-launchpad:/root/.mirantis-launchpad" \
+  -v "${LAB_DIR}/.bashrc:/root/.bashrc:ro" \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
+  registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+```
+
+The project mount preserves `terraform/terraform.tfstate` and generated files; `.mke` preserves the MKE4k kubeconfig, and `.mirantis-launchpad` preserves the online MKE3 client bundle. The `.bashrc` mount enables the local `t expiry status` banner even when using an older prebuilt image. The host checkout supplies `bin/t-commandline.bash`, so update the checkout along with the image. A fresh checkout needs `terraform init`, which `t deploy lab` runs before applying. Export AWS credentials in each new shell session. `--rm` removes only the container after exit, while the bind-mounted files remain on the host.
+
 ### Option B — Build the Docker image yourself
 
 ```bash
@@ -64,7 +80,7 @@ t show nodes              # print IPs
 t destroy lab             # teardown
 ```
 
-**Re-attaching after exit** — `terraform.tfstate`, `mke4.yaml`, and `aws_private.pem` live inside the container, so keep it around:
+**Re-attaching after exit without bind mounts** — `terraform.tfstate`, `mke4.yaml`, and `aws_private.pem` live inside the named container, so keep it around:
 ```bash
 docker start -ai mke4k-lab
 ```

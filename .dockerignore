@@ -2,6 +2,8 @@
 .owner
 .expiry-days
 .expiry-base
+.mke/
+.mirantis-launchpad/
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/
