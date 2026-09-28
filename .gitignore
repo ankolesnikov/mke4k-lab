@@ -2,6 +2,8 @@
 .owner
 .expiry-days
 .expiry-base
+.mke/
+.mirantis-launchpad/
 .claude
 .DS_Store
 mke3/

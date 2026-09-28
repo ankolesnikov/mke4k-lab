@@ -3761,6 +3761,62 @@ cmd_destroy_lab() {
     success "Lab destroyed."
 }
 
+# Format a seconds delta as "Xd Yh" (or "Xh Ym" under a day).
+fmt_time_delta() {
+    local s=$1
+    local d=$(( s / 86400 ))
+    local h=$(( (s % 86400) / 3600 ))
+    local m=$(( (s % 3600) / 60 ))
+    if (( d > 0 )); then
+        printf "%dd %dh" "${d}" "${h}"
+    elif (( h > 0 )); then
+        printf "%dh %dm" "${h}" "${m}"
+    else
+        printf "%dm" "${m}"
+    fi
+}
+
+# Read only local Terraform output; never load config or create a cluster ID.
+expiry_status_line() {
+    local output
+    output="$(tf_output)" || output=""
+    if [[ -z "${output}" || "${output}" == "{}" ]]; then
+        info "No lab currently provisioned in this workspace."
+        return 0
+    fi
+
+    local et
+    et="$(jq -r '.expiry_time.value // empty' <<<"${output}" 2>/dev/null || true)"
+    if [[ -z "${et}" ]]; then
+        warn "Lab is up; auto-expiry is disabled — remember 't destroy lab' when done."
+        return 0
+    fi
+
+    local deadline now delta disp_time dry_run_tf
+    deadline="$(date -u -d "${et}" +%s 2>/dev/null || true)"
+    if [[ -z "${deadline}" ]]; then
+        info "Auto-expiry: ${et} (unable to compute remaining time)."
+        return 0
+    fi
+    now="$(date -u +%s)"
+    disp_time="${et/T/ }"
+    disp_time="${disp_time%Z}"
+    disp_time="${disp_time%:*} UTC"
+    dry_run_tf="$(grep -E '^expiry_dry_run' "${TERRAFORM_DIR}/terraform.tfvars" 2>/dev/null | awk '{print $3}' || true)"
+
+    if (( deadline > now )); then
+        delta=$(( deadline - now ))
+        success "Lab expires in $(fmt_time_delta "${delta}") (deadline: ${disp_time})."
+    else
+        delta=$(( now - deadline ))
+        if [[ "${dry_run_tf}" == "true" ]]; then
+            warn "Lab's expiry deadline (${disp_time}) passed $(fmt_time_delta "${delta}") ago, but expiry_dry_run is on — nothing was deleted. Run 't destroy lab' when done, or 't expiry <N>' to extend."
+        else
+            warn "⚠ Lab's expiry deadline (${disp_time}) passed $(fmt_time_delta "${delta}") ago — it may already have been deleted by the AWS reaper. Run 't status' to check, or 't expiry <N>' to re-arm if it's still alive."
+        fi
+    fi
+}
+
 # Reaper resources only — an 't expiry' apply must never touch the cluster.
 _EXPIRY_TARGETS=(
     -target=time_offset.expiry
@@ -3777,8 +3833,10 @@ _EXPIRY_TARGETS=(
 # resources (a targeted apply), so a running cluster is never touched.
 cmd_expiry() {
     local arg="${1:-show}"
+    local output
+    output="$(tf_output)" || die "No lab found (no terraform state). Deploy a lab first with 't deploy lab'."
+    [[ -n "${output}" && "${output}" != "{}" ]] || die "No lab found (no terraform state). Deploy a lab first with 't deploy lab'."
     load_config
-    tf_output >/dev/null 2>&1 || die "No lab found (no terraform state). Deploy a lab first with 't deploy lab'."
 
     if [[ "${arg}" == "show" ]]; then
         local et
@@ -6842,6 +6900,7 @@ usage() {
     echo "  destroy k0rdent-ui          Remove the k0rdent UI gateway resources"
     echo "  destroy lab                 Destroy all AWS infrastructure (terraform destroy)"
     echo "  expiry [<days>|off|show]    Show/change/disable auto-expiry (re-arms to now+<days>; targeted apply)"
+    echo "  expiry status               Show local expiry status without AWS credentials"
     echo "  status                      Show cluster node status (kubectl get nodes)"
     echo "  show nodes                  Print controller/worker IPs and load balancer DNS"
     echo "  show summary                Reprint the deploy summary box (credentials, URLs, IPs)"
@@ -6962,7 +7021,13 @@ case "${COMMAND}" in
         esac
         ;;
     status)    cmd_status ;;
-    expiry)    cmd_expiry "${SUBCOMMAND}" ;;
+    expiry)
+        if [[ "${SUBCOMMAND:-}" == "status" ]]; then
+            expiry_status_line
+        else
+            cmd_expiry "${SUBCOMMAND}"
+        fi
+        ;;
     show)
         case "${SUBCOMMAND}" in
             nodes)   cmd_show_nodes ;;
