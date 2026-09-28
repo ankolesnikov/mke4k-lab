@@ -65,7 +65,7 @@ t deploy msr4 airgap      # images/charts mirrored to the bastion Harbor first
 
 # k0rdent UI (requires k0rdent_ui_enabled=true; auto-runs in lab deploys when enabled)
 t deploy k0rdent-ui       # terraform (NLB listener + SG) + rotate password + Envoy gateway
-t destroy k0rdent-ui      # delete gateway resources (password + NLB listener stay)
+t destroy k0rdent-ui      # delete gateway resources + targeted destroy of the NLB listener/TG (password stays)
 
 # KOF observability (requires MKE 4.2.0+; kof_enabled=true auto-runs it in lab deploys)
 t deploy kof [full|lean]        # Deploy KOF on an existing cluster (online)
@@ -82,7 +82,7 @@ t deploy nfs [mke3]       # NFS server + provisioner on an existing cluster (aut
 t expiry                  # Show the current auto-expiry deadline
 t expiry 5                # Re-arm auto-expiry to 5 days from now (targeted apply; cluster untouched)
 t expiry off              # Disable auto-expiry (removes the reaper; lab won't self-delete)
-t status                  # kubectl get nodes
+t status                  # kubectl get nodes (airgap: on the bastion; MKE3: via client bundle)
 t show nodes              # Print IPs + NLB DNS
 t show summary            # Reprint the deploy summary box (credentials, URLs, IPs)
 t connect m1              # SSH into controller-1 (m1/m2/m3 or w1/w2/w3, or a raw IP)
@@ -241,11 +241,11 @@ Reads/writes the configuration of a **running** cluster; the variant suffix foll
 
 ### k0rdent UI (`t deploy k0rdent-ui`)
 
-MKE4k ships the k0rdent UI (`svc/kcm-k0rdent-ui:3000`, ns `k0rdent`) ClusterIP-only with a fixed default password. `cmd_deploy_k0rdent_ui`: (1) regenerates tfvars preserving the mke3/airgap flags and runs `terraform apply` for the NLB listener + SG NodePort rule; (2) `k0rdent_ui_preflight`; (3) `k0rdent_ui_rotate_password` — JSON merge patch on `Management/kcm` `spec.core.kcm.config.k0rdent-ui.auth.basic.password`; (4) `k0rdent_ui_install_gateway` — airgap pins the Envoy data-plane image to MKE's own envoy image. All kubectl calls go through `_msr_kexec` (local online, bastion in airgap). `t destroy k0rdent-ui` only deletes the gateway objects.
+MKE4k ships the k0rdent UI (`svc/kcm-k0rdent-ui:3000`, ns `k0rdent`) ClusterIP-only with a fixed default password. `cmd_deploy_k0rdent_ui`: (1) regenerates tfvars preserving the mke3/airgap flags and runs `terraform apply` for the NLB listener + SG NodePort rule; (2) `k0rdent_ui_preflight`; (3) `k0rdent_ui_rotate_password` — JSON merge patch on `Management/kcm` `spec.core.kcm.config.k0rdent-ui.auth.basic.password`; (4) `k0rdent_ui_install_gateway` — airgap pins the Envoy data-plane image to MKE's own envoy image. All kubectl calls go through `_msr_kexec` (local online, bastion in airgap). `t destroy k0rdent-ui` deletes the gateway objects, then runs a **targeted** `terraform destroy` of `aws_lb_listener`/`aws_lb_target_group(_attachment).k0rdent_ui` (never a full apply). The SG NodePort/listener-port rules for Grafana and k0rdent UI are unconditional; only the NLB target group/listener/attachments are gated on the toggles. If `k0rdent_ui_enabled` is still `true` in config, the next full apply recreates the listener.
 
 ### Known limitations
 
-- `t status` uses the local `~/.mke/mke.kubeconf`: in airgap that points at the internal NLB (unreachable from the container), and MKE3 has no such kubeconfig (use `t gen client-bundle`).
+- The local `~/.mke/mke.kubeconf` in airgap points at the internal NLB (unreachable from the container). `cmd_status` therefore runs kubectl on the bastion (MKE4k kubeconfig, else MKE3 client bundle); online it prefers the local MKE4k kubeconfig and falls back to the MKE3 client bundle. Other local `kubectl` use in airgap needs a 6443 tunnel.
 - `bin/cleanup-aws.sh` does not delete the expiry reaper (Lambda/schedule/IAM roles); if left, it fires at the deadline and self-cleans.
 
 ### Node addressing

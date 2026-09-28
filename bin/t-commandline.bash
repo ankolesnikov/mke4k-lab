@@ -5243,8 +5243,28 @@ cmd_destroy_k0rdent_ui() {
     info "Removing k0rdent UI gateway resources..."
     _msr_kexec "${mode}" "${ssh_key}" "${bastion_ip}" \
         "kubectl delete -n k0rdent httproute/k0rdent-ui gateway/k0rdent-ui envoyproxy/k0rdent-ui-nodeport certificate/k0rdent-ui issuer/k0rdent-ui-selfsigned --ignore-not-found" || true
+    # Drop the NLB listener + target group (+ attachments, which depend on it).
+    # A targeted destroy removes only these and never touches the cluster —
+    # unlike a full apply, which needs the whole lab topology to be right.
+    # The SG NodePort rules are unconditional and stay (nothing listens there).
+    if terraform -chdir="${TERRAFORM_DIR}" state list 2>/dev/null | grep -q '^aws_lb_listener\.k0rdent_ui'; then
+        info "Removing the k0rdent UI NLB listener + target group (targeted terraform destroy)..."
+        if [[ ! -f "${TERRAFORM_DIR}/terraform.tfvars" ]]; then
+            local airgap_tf="false"
+            [[ "${mode}" == "airgap" ]] && airgap_tf="true"
+            write_tfvars false "${airgap_tf}"
+        fi
+        terraform -chdir="${TERRAFORM_DIR}" destroy -auto-approve -compact-warnings \
+            -target=aws_lb_listener.k0rdent_ui \
+            -target=aws_lb_target_group_attachment.k0rdent_ui \
+            -target=aws_lb_target_group.k0rdent_ui
+    fi
+
     warn "The rotated UI password stays in Management/kcm (and terraform/k0rdent_ui_credentials.txt)."
-    warn "The NLB listener stays until you set k0rdent_ui_enabled=false and re-run 't deploy lab' (terraform)."
+    if [[ "${k0rdent_ui_enabled}" == "true" ]]; then
+        warn "k0rdent_ui_enabled=true in config — the next terraform apply (t deploy lab, t deploy kof, ...)"
+        warn "  recreates the NLB listener. Set k0rdent_ui_enabled=false to keep it off."
+    fi
     success "k0rdent UI gateway removed."
     return 0
 }
@@ -6305,13 +6325,63 @@ cmd_deploy_msr4_airgap() {
     print_msr4_summary airgap "${fqdn}"
 }
 
+# Node status for whatever the lab runs. The local ~/.mke/mke.kubeconf only works
+# for online MKE4k: in airgap it points at the *internal* NLB (unreachable from
+# here), and MKE3 has no such kubeconfig. So:
+#   airgap -> kubectl on the bastion (MKE4k kubeconfig, else MKE3 client bundle)
+#   online -> local MKE4k kubeconfig, else MKE3 client bundle
+# The MKE4k kubeconfig wins when both exist (MKE3 lab already upgraded to MKE4k).
 cmd_status() {
-    local kc="${KUBECONFIG}"
-    if [[ ! -f "${kc}" ]]; then
-        die "Kubeconfig not found at ${kc}. Has the cluster been deployed?"
+    load_config
+    local output
+    output="$(tf_output 2>/dev/null || true)"
+
+    local bastion_ip mke3_lb_dns ssh_key
+    bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null || true)"
+    mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null || true)"
+    ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value // empty' 2>/dev/null || true)"
+
+    if [[ -n "${bastion_ip}" && "${bastion_ip}" != "null" ]]; then
+        ensure_kubectl_on_bastion "${ssh_key}" "${bastion_ip}" >/dev/null
+        info "Cluster node status (via bastion ${bastion_ip}):"
+        # No 'set -u': env.sh may reference unset vars
+        ssh_node "${ssh_key}" "${bastion_ip}" "
+            set -eo pipefail
+            if [[ -f ~/.mke/mke.kubeconf ]]; then
+                export KUBECONFIG=~/.mke/mke.kubeconf
+            elif [[ -f ~/launchpad.yaml ]] && command -v launchpad &>/dev/null; then
+                launchpad client-config -a -c ~/launchpad.yaml >/dev/null
+                BUNDLE_DIR=\$(ls -d ~/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1 || true)
+                [[ -n \"\${BUNDLE_DIR}\" ]] || { echo 'ERROR: MKE3 client bundle not found on bastion.'; exit 1; }
+                cd \"\${BUNDLE_DIR}\"
+                source env.sh
+            else
+                echo 'ERROR: no kubeconfig on bastion (~/.mke/mke.kubeconf or ~/launchpad.yaml). Has the cluster been deployed?'
+                exit 1
+            fi
+            kubectl get nodes -o wide
+        "
+        return 0
     fi
-    info "Cluster node status:"
-    kubectl --kubeconfig="${kc}" get nodes -o wide
+
+    if [[ -f "${KUBECONFIG}" ]]; then
+        info "Cluster node status:"
+        kubectl --kubeconfig="${KUBECONFIG}" get nodes -o wide
+    elif [[ -n "${mke3_lb_dns}" && "${mke3_lb_dns}" != "null" ]]; then
+        local bundle_dir
+        bundle_dir="$(ensure_mke3_client_bundle)"
+        info "Cluster node status (MKE3 client bundle):"
+        (
+            cd "${bundle_dir}"
+            set +u   # env.sh may reference unset vars
+            # shellcheck source=/dev/null
+            source env.sh
+            set -u
+            kubectl get nodes -o wide
+        )
+    else
+        die "Kubeconfig not found at ${KUBECONFIG}. Has the cluster been deployed?"
+    fi
 }
 
 cmd_show_nodes() {
