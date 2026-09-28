@@ -18,9 +18,9 @@ docker pull registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 docker run -it --name mke4k-lab registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 
 # For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry / KOF Grafana, 8444 = MSR4 (Harbor) UI
+#   3000 = MKE4k/MKE3 Dashboard, 8443 = KOF Grafana, 8444 = MSR4 (Harbor) UI, 8445 = k0rdent UI
 docker run -it --name mke4k-lab \
-  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
   registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 ```
 
@@ -43,9 +43,9 @@ docker build -t mke4k-lab .
 docker run -it --name mke4k-lab mke4k-lab
 
 # For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8443 = Harbor registry / KOF Grafana, 8444 = MSR4 (Harbor) UI
+#   3000 = MKE4k/MKE3 Dashboard, 8443 = KOF Grafana, 8444 = MSR4 (Harbor) UI, 8445 = k0rdent UI
 docker run -it --name mke4k-lab \
-  -p 3000:3000 -p 8443:8443 -p 8444:8444 \
+  -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
   mke4k-lab
 ```
 
@@ -81,9 +81,11 @@ docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
 
 - AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 - `terraform` >= 0.14.3
-- `mkectl`
 - `kubectl`
-- `jq`, `yq`
+- `helm` v3 (NFS provisioner, MSR4, KOF — helm v4 is not supported by KOF)
+- `jq`, `yq` (mikefarah v4), `openssl`, `ssh`/`scp`
+- `aws` CLI v2 (only for `bin/cleanup-aws.sh`)
+- `mkectl` and `launchpad` are downloaded automatically at the versions set in `config`
 
 ### 1. Edit config
 
@@ -92,12 +94,13 @@ vi config
 ```
 
 ```bash
-cluster_name="mke4k-lab"       # auto-suffixed with random 4-char ID (e.g. mke4k-lab-a3f2)
+cluster_name="mke4k-lab"       # first deploy asks for your name -> mke4k-lab-<name> (random ID if non-interactive)
 controller_count=1
 worker_count=1
 controller_flavor="m5a.xlarge"
 worker_flavor="m5a.large"
 region="eu-central-1"
+expiry_days=3                  # lab auto-deletes after 3 days (0 = never) — see "Auto-expiry"
 mke4k_version="v4.2.0"
 os_name="ubuntu"               # cluster node OS: ubuntu or redhat
 os_version="22.04"             # ubuntu: 22.04/24.04 | redhat: 9.6/8.10
@@ -117,9 +120,12 @@ export AWS_SECRET_ACCESS_KEY="..."
 ```
 
 This will:
-1. Run `terraform init` + `terraform apply` (provisions dedicated VPC + EC2 + NLB + IAM)
-2. Generate `terraform/mke4.yaml` from the provisioned infrastructure
-3. Run `mkectl apply -f terraform/mke4.yaml`
+1. Run `terraform init` + `terraform apply` (provisions dedicated VPC + EC2 + NLB + IAM + the auto-expiry reaper)
+2. Verify every node's hostname is its EC2 private DNS name (required by the AWS CCM)
+3. Generate `terraform/mke4.yaml` from the provisioned infrastructure
+4. Run `mkectl apply -f terraform/mke4.yaml`
+5. Optionally, per `config`: NFS server + `nfs-client` StorageClass (`nfs_enabled`), KOF (`kof_enabled`), k0rdent UI (`k0rdent_ui_enabled`)
+6. Print the deploy summary (URLs, credentials, IPs, expiry time) — reprint any time with `t show summary`
 
 ## Recipes
 
@@ -251,6 +257,20 @@ t deploy kof airgap       # add full|lean before 'airgap' to override kof_mode
 t tunnel grafana          # then browse https://localhost:8443  (needs -p 8443:8443)
 ```
 
+### Publish the k0rdent UI
+
+```bash
+# config
+k0rdent_ui_enabled=true   # auto-runs at the end of 't deploy lab' / 't deploy lab airgap'
+```
+
+```bash
+t deploy lab
+# or on an existing MKE4k cluster:
+t deploy k0rdent-ui
+# Online:  https://<nlb-dns>:8445   Airgap: t tunnel k0rdent-ui -> https://localhost:8445 (needs -p 8445:8445)
+```
+
 ### Deploy MKE3 v3.8.2, then test the in-place upgrade to MKE4k
 
 ```bash
@@ -263,6 +283,10 @@ mke4k_version="v4.2.0"    # the upgrade target (shipped default)
 t deploy lab mke3         # provisions both NLBs + launchpad apply
 # the deploy summary prints a ready-to-paste mkectl upgrade command
 ```
+
+In the airgap modes, the end of the deploy asks whether to prepare an upgrade:
+- `t deploy lab mke3-airgap` → MKE3 → MKE4k: uploads the MKE4k bundle to Harbor and generates `mke4.yaml` on the bastion.
+- `t deploy lab airgap` → MKE4k → MKE4k: prompts for a target version, uploads its bundle (using dual-path mode for v4.1.3), downloads `release-matrix.json`, and prints the upgrade command.
 
 ## CLI Commands
 
@@ -309,14 +333,15 @@ t deploy lab mke3         # provisions both NLBs + launchpad apply
 
 | Command | Description |
 |---|---|
-| `t deploy nfs` | Setup NFS server + install CSI driver (cluster must exist) |
+| `t deploy nfs` | Setup NFS server + install the NFS provisioner / `nfs-client` StorageClass (cluster must exist; auto-detects airgap) |
+| `t deploy nfs mke3` | Same, for an MKE3 cluster (kubeconfig from the launchpad client bundle) |
 | `t connect nfs` | SSH to NFS server (direct or via bastion in airgap) |
 
-Set `nfs_enabled=true` in `config` to automatically provision NFS during `t deploy lab` or `t deploy lab airgap`. Or use `t deploy nfs` to add NFS to an already-running cluster.
+Set `nfs_enabled=true` in `config` (the shipped default) to automatically provision NFS during every `t deploy lab` variant (`mke4`, `mke3`, `airgap`, `mke3-airgap`). Or use `t deploy nfs` to add NFS to an already-running cluster.
 
-Creates a dedicated NFS server EC2 instance, installs `nfs-common` on all cluster nodes, and deploys the [`nfs-subdir-external-provisioner`](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner) Helm chart with a default `nfs-client` StorageClass.
+Creates a dedicated NFS server EC2 instance, installs the NFS client on all cluster nodes (`nfs-common` on Ubuntu, `nfs-utils` on RHEL), and deploys the [`nfs-subdir-external-provisioner`](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner) Helm chart with a default `nfs-client` StorageClass.
 
-**Airgap support:** `.deb` packages are downloaded on the bastion and transferred via SCP. The provisioner image (`registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2`) is uploaded to a Harbor `nfs` project and the Helm chart is pulled on the bastion for offline install.
+**Airgap support:** Ubuntu nodes get `.deb` packages downloaded on the bastion and transferred via SCP; RHEL nodes install `nfs-utils` via dnf through the bastion's Squid proxy (RHUI). The provisioner image (`registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2`) is uploaded to a Harbor `nfs` project and the Helm chart is pulled on the bastion for offline install.
 
 ### MSR4 (Harbor) on cluster
 
@@ -395,6 +420,42 @@ t destroy kof
 
 > With `kof_enabled=true` in `config`, step 2 runs automatically at the end of `t deploy lab` — no separate `t deploy kof` needed. The same applies to `t deploy lab airgap` (KOF then installs from the bastion; Grafana via `t tunnel grafana`).
 
+### k0rdent UI
+
+| Command | Description |
+|---|---|
+| `t deploy k0rdent-ui` | Rotate the k0rdent UI password + publish the UI over HTTPS (auto-detects airgap) |
+| `t destroy k0rdent-ui` | Remove the k0rdent UI gateway resources |
+| `t tunnel k0rdent-ui` | Airgap: tunnel → `https://localhost:8445` |
+
+MKE4k ships the k0rdent Enterprise UI (service `kcm-k0rdent-ui` in namespace `k0rdent`) as ClusterIP-only with a fixed default basic-auth password. With `k0rdent_ui_enabled=true` (required — the command dies otherwise), `t deploy k0rdent-ui`:
+
+1. Runs `terraform apply` to add an NLB listener (`k0rdent_ui_lb_port`, default `8445`) + a security-group rule for a pinned Envoy NodePort (`k0rdent_ui_nodeport`, default `33003`). Idempotent; preserves the deployed mke3/airgap topology.
+2. Rotates the UI password to a random value by patching `Management/kcm` (`spec.core.kcm.config.k0rdent-ui.auth.basic`) and waits for the rollout. Credentials are saved to `terraform/k0rdent_ui_credentials.txt` (user `admin`) and reused on later runs.
+3. Applies `k0rdent-ui/k0rdent-ui-gateway.yaml` (self-signed `Issuer`/`Certificate` + `EnvoyProxy`/`Gateway`/`HTTPRoute` in namespace `k0rdent`). Cert SANs = NLB DNS + node IPs. In airgap the Envoy data-plane image is pinned to MKE's own envoy image so it pulls from Harbor.
+
+It runs automatically at the end of `t deploy lab` / `t deploy lab airgap` when enabled. Nothing new is pulled, so airgap needs no extra registry uploads.
+
+**Access:** online `https://<nlb-dns>:8445` or `https://<node-public-ip>:33003`; airgap `t tunnel k0rdent-ui` → `https://localhost:8445` (needs `-p 8445:8445`). The login is printed at the end of the deploy.
+
+`t destroy k0rdent-ui` deletes only the gateway resources. The rotated password stays in `Management/kcm`, and the NLB listener stays until you set `k0rdent_ui_enabled=false` and re-run the `t deploy instances` variant that matches your lab (e.g. `t deploy instances airgap`) — the plain variant would rewrite tfvars for an online MKE4k topology.
+
+### Auto-expiry
+
+| Command | Description |
+|---|---|
+| `t expiry` | Show the current auto-expiry deadline |
+| `t expiry <days>` | Re-arm the deadline to `<days>` (≥1) days from **now** |
+| `t expiry off` | Disable auto-expiry (the lab will not self-delete) |
+
+Every lab deletes itself `expiry_days` (default `3`) days after creation unless `t destroy lab` runs first. Terraform provisions a reaper entirely inside AWS — an EventBridge Scheduler one-shot that invokes a Lambda (`terraform/reaper.py`) — so it fires even if your container or laptop is off, and works in airgap too (the Lambda runs outside the lab VPC). The Lambda deletes every resource tagged with the lab's `Cluster` tag (EC2, NLBs + target groups, VPC and dependencies, CCM IAM, key pair), then removes its own schedule, roles and function.
+
+- `t destroy lab` removes the schedule with everything else, so the reaper only fires on abandoned labs.
+- `t expiry <days>|off` does a **targeted** `terraform apply` of the reaper resources only — the running cluster is never touched. The override is stored in `.expiry-days` / `.expiry-base` (project root) and takes precedence over `config`; `t destroy lab` clears it.
+- `expiry_days=0` in `config` disables the reaper from the start.
+- `expiry_dry_run=true` makes the Lambda log what it *would* delete (CloudWatch) without deleting anything. Invoke it on demand: `aws lambda invoke --function-name <cluster_name>-reaper /dev/stdout`.
+- The deadline is shown in the deploy summary and by `t expiry`.
+
 ### Cluster configuration
 
 | Command | Description |
@@ -448,27 +509,42 @@ t config apply
 | `t tunnel` | Show available SSH tunnels with manual commands |
 | `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
 | `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
-| `t tunnel registry` | Harbor Registry tunnel -> https://localhost:8443 (optional; the bastion's Harbor is also reachable directly at `https://<bastion-public-ip>`) |
+| `t tunnel registry` | No tunnel — prints the bastion Harbor URL `https://<bastion-public-ip>` (publicly reachable; SG opens 443) |
 | `t tunnel msr4` | MSR4 Harbor UI tunnel -> https://localhost:8444 |
-| `t tunnel grafana` | KOF Grafana tunnel -> https://localhost:8443 (shares the local port with `t tunnel registry` — run one at a time) |
+| `t tunnel k0rdent-ui` | k0rdent UI tunnel -> https://localhost:8445 (`k0rdent_ui_lb_port`) |
+| `t tunnel grafana` | KOF Grafana tunnel -> https://localhost:8443 (`kof_grafana_lb_port`) |
+
+Each tunnel needs the matching `-p` mapping on `docker run`. `t tunnel` with no argument also prints a manual SSH command for forwarding the Kubernetes API (`6443`) through the bastion.
 
 ### General
 
 | Command | Description |
 |---|---|
-| `t status` | Show cluster node status (`kubectl get nodes`) |
+| `t status` | Show cluster node status (`kubectl get nodes` with `~/.mke/mke.kubeconf`). MKE4k online only — see note below |
 | `t show nodes` | Print IPs and NLB DNS name |
+| `t show summary` | Reprint the deploy summary box (credentials, URLs, IPs, expiry) |
+| `t gen client-bundle [mke3]` | MKE3: download the admin client bundle (`cd <dir> && source env.sh`); in airgap it is generated on the bastion |
+| `t gen client-bundle mke4` | Print the MKE4k kubeconfig path |
 | `t connect bastion` | SSH to bastion/registry host (airgap only) |
 | `t connect nfs` | SSH to NFS server (when `nfs_enabled=true`) |
 | `t connect m1` | SSH to controller-1 (via ProxyCommand when airgap) |
 | `t connect w1` | SSH to worker-1 |
 | `t connect <node> "cmd"` | Run a single command on a node |
+| `t connect <ip>` | SSH to any raw IP or hostname |
+
+> **`t status` limits:** it uses the local `~/.mke/mke.kubeconf`. In airgap that kubeconfig points at the internal NLB, which the container can't reach — use `t connect bastion` and run `kubectl` there (`KUBECONFIG=~/.mke/mke.kubeconf`), or forward 6443 as shown by `t tunnel`. For MKE3 use the client bundle (`t gen client-bundle`).
+
+**Container shell extras** (`.bashrc`): `connect m1` works as a shortcut for `t connect m1`; `k` = `kubectl`, `h` = `helm`; `KUBECONFIG` is set automatically once `~/.mke/mke.kubeconf` exists; `config` is sourced so its variables are available in the shell.
 
 ## Project Structure
 
 ```
 mke4k-lab/
 ├── config                        # User-edited config (edit this)
+├── Dockerfile                    # Two-stage image: terraform, kubectl, helm, aws, k9s, yq
+├── .bashrc                       # Container shell: aliases, connect shortcut, KUBECONFIG
+├── kof/                          # KOF assets: global-values.yaml, grafana*.yaml, profiles/{full,lean}.yaml
+├── k0rdent-ui/                   # k0rdent UI Envoy gateway manifest
 ├── bin/
 │   ├── t                         # Thin launcher
 │   ├── t-commandline.bash        # CLI implementation
@@ -484,7 +560,9 @@ mke4k-lab/
     ├── airgap.tf                 # Bastion + private subnet (conditional on airgap_enabled)
     ├── nfs.tf                    # NFS server EC2 (conditional on nfs_enabled)
     ├── iam.tf                    # IAM role + CCM policy + instance profile
-    └── outputs.tf                # lb_dns_name, IPs, ssh key path, bastion IPs, NFS IPs
+    ├── expiry.tf                 # Auto-expiry reaper: EventBridge schedule + Lambda + IAM
+    ├── reaper.py                 # Reaper Lambda source (zipped at apply time)
+    └── outputs.tf                # lb_dns_name, IPs, DNS names, ssh key path, bastion IPs, NFS IPs, expiry_time
 ```
 
 ## What Terraform Creates
@@ -496,13 +574,28 @@ mke4k-lab/
 | `aws_vpc` + `aws_internet_gateway` | Dedicated VPC (`172.31.0.0/16`) with IGW — full isolation per lab |
 | `aws_subnet` (public) | `172.31.0.0/24` with `map_public_ip_on_launch` |
 | `tls_private_key` + `aws_key_pair` | RSA-4096 key pair, PEM saved to `terraform/aws_private.pem` |
-| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001, 30080 + intra-cluster |
+| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001 (ingress), 33443 (MSR4), 30080, `kof_grafana_nodeport` (33002) + `k0rdent_ui_nodeport` (33003) when enabled, + intra-cluster |
 | `aws_instance` (controllers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.xlarge` (configurable), 50GB gp3 |
 | `aws_instance` (workers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.large` (configurable), 50GB gp3 |
 | `aws_lb` (NLB) | Public NLB in public subnet (internal in airgap) |
-| `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (33001) — all **IP-type** |
+| `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (NLB 443 → 33001) — all **IP-type** |
 | `aws_iam_role` + `aws_iam_policy` | AWS CCM minimum permissions (when `ccm_enabled`, auto-disabled in airgap) |
 | `aws_iam_instance_profile` | Attached to all EC2 instances (when `ccm_enabled`) |
+
+### Auto-expiry (`expiry_days > 0`)
+
+| Resource | Details |
+|---|---|
+| `time_offset` | Fixes the expiry moment (`expiry_base` + `expiry_days`) |
+| `aws_lambda_function` (reaper) | `<cluster_name>-reaper`, runs `reaper.py`; `DRY_RUN` from `expiry_dry_run` |
+| `aws_scheduler_schedule` | EventBridge Scheduler one-shot `at()` that invokes the Lambda |
+| `aws_iam_role` x2 + policies | Scoped roles for the Lambda and the scheduler |
+
+### KOF Grafana / k0rdent UI (`kof_grafana_gateway_enabled` / `k0rdent_ui_enabled`)
+
+| Resource | Details |
+|---|---|
+| NLB listener + IP-type target group | Grafana: `kof_grafana_lb_port` (8443) → `kof_grafana_nodeport` (33002); k0rdent UI: `k0rdent_ui_lb_port` (8445) → `k0rdent_ui_nodeport` (33003). TCP pass-through (online only; airgap uses tunnels) |
 
 ### MKE3 mode (`mke3_enabled`)
 
@@ -549,13 +642,14 @@ t tunnel mke3
 # Airgap: access Harbor UI — the bastion has a public IP and the SG opens 443,
 # so browse it directly (no tunnel/port mapping needed):
 #   https://<bastion-public-ip>      (see `t show nodes` for the IP)
-# Or, if you prefer a tunnel (requires -p 8443:8443 on docker run):
-t tunnel registry
-# then browse https://localhost:8443
 
 # Airgap: access MSR4 (Harbor) UI (requires -p 8444:8444 on docker run)
 t tunnel msr4
 # then browse https://localhost:8444
+
+# Airgap: access the k0rdent UI (requires -p 8445:8445 on docker run)
+t tunnel k0rdent-ui
+# then browse https://localhost:8445
 
 # Airgap: access KOF Grafana (requires -p 8443:8443 on docker run)
 t tunnel grafana
@@ -571,7 +665,9 @@ t destroy lab
 
 | Variable | Default | Description |
 |---|---|---|
-| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, a random 4-char suffix is auto-appended (e.g. `mke4k-lab-a3f2`) to avoid collisions between users. Persisted in `.cluster-id` |
+| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, the first `t deploy lab\|instances` asks for your name (interactive terminal only) → `mke4k-lab-<name>` plus an `Owner` tag on every resource; non-interactive runs get a random 4-char suffix (e.g. `mke4k-lab-a3f2`). Persisted in `.cluster-id` / `.owner` |
+| `expiry_days` | `3` | Auto-delete the whole lab this many days after creation (`0` = never). See [Auto-expiry](#auto-expiry) |
+| `expiry_dry_run` | `false` | Reaper only logs what it would delete (CloudWatch) |
 | `controller_count` | `1` | Number of controller nodes (use 3 for HA) |
 | `worker_count` | `1` | Number of worker nodes |
 | `controller_flavor` | `m5a.xlarge` | EC2 instance type for controllers |
@@ -579,14 +675,22 @@ t destroy lab
 | `region` | `eu-central-1` | AWS region |
 | `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu) |
 | `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn) |
-| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
+| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. MKE3: adds `--cloud-provider=aws`. Auto-disabled in airgap. (If the line is removed from `config`, the fallback is `true`) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (all modes including airgap) |
 
 ### MKE4k settings
 
 | Variable | Default | Description |
 |---|---|---|
-| `mke4k_version` | `v4.2.0` | MKE4k / mkectl version |
+| `mke4k_version` | `v4.2.0` | MKE4k / mkectl version. Override the mkectl download with the `MKECTL_DOWNLOAD_URL` env var |
+
+### k0rdent UI settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI at the end of `t deploy lab` / `t deploy lab airgap`; also required for `t deploy k0rdent-ui`. **Touches terraform** (NLB listener + SG rule) |
+| `k0rdent_ui_nodeport` | `33003` | NodePort the Envoy gateway is pinned to (range 32768-35535; 33001/33002/33443 taken) |
+| `k0rdent_ui_lb_port` | `8445` | NLB listener port (online) / local port of `t tunnel k0rdent-ui` (airgap) |
 
 ### MKE3 settings
 
@@ -612,7 +716,7 @@ t destroy lab
 
 | Variable | Default | Description |
 |---|---|---|
-| `nfs_enabled` | `true` | Provisions NFS server EC2, installs nfs-common on nodes, deploys nfs-subdir-external-provisioner |
+| `nfs_enabled` | `true` | Provisions NFS server EC2, installs the NFS client on nodes, deploys nfs-subdir-external-provisioner. (If the line is removed from `config`, the fallback is `false`) |
 | `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
 | `nfs_disk_gb` | `150` | Root volume size (GB) for the NFS server. Sized with headroom for KOF's VictoriaMetrics/Logs/Traces PVCs, which land on `nfs-client` |
 | `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
@@ -647,6 +751,8 @@ t destroy lab
 | `kof_grafana_lb_port` | `8443` | NLB listener port for Grafana (TCP pass-through; the gateway terminates TLS). In airgap this is the local port of `t tunnel grafana` |
 | `kof_reuse_mke_monitoring` | `true` | Reuse MKE4's built-in monitoring instead of duplicating it (drops KOF's node-exporter + kube-proxy/coredns/apiserver scrapes, KSM custom-resource-only, adds MKE's Prometheus as Grafana datasource) |
 | `kof_reuse_mke_kubelet` | `true` | Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted (~2x otherwise) |
+| `kof_lean_prune_folders` | `Istio,Opencost,Victoria Traces` | Lean mode: Grafana dashboard folders to drop (comma-separated) |
+| `kof_lean_prune_dashboards` | `kps-nodes-aix,kps-nodes-darwin` | Lean mode: individual dashboards to drop (comma-separated) |
 | `kof_sf_notifier_enabled` | `false` | Route alerts with severity critical\|warning\|error to the sf-notifier webhook. sf-notifier itself is deployed separately by hand — leave `false` unless it is running |
 
 ## Airgap Architecture
@@ -717,3 +823,23 @@ If you lose Terraform state (e.g. removed the Docker container), use the cleanup
 ```
 
 The script shows all discovered resources first, then asks for confirmation before each deletion step.
+
+It does **not** delete the auto-expiry reaper (Lambda `<cluster>-reaper`, its EventBridge schedule and IAM roles). If left alone, the reaper still fires at the deadline, finds nothing left to delete, and removes itself. Delete it by hand if you want it gone sooner.
+
+## Generated files
+
+Everything below is git- and docker-ignored and lives inside the container:
+
+| File | Contents |
+|---|---|
+| `.cluster-id`, `.owner` | Cluster name suffix and owner name (project root) |
+| `.expiry-days`, `.expiry-base` | `t expiry` override (project root) |
+| `terraform/terraform.tfstate`, `terraform.tfvars` | Terraform state and generated variables |
+| `terraform/aws_private.pem` | SSH key for all instances |
+| `terraform/mke4.yaml` (+ `.bak`) | MKE4k config (generated, or pulled by `t config get`) |
+| `terraform/launchpad.yaml`, `mke3-config.toml` (+ `.bak`) | MKE3 launchpad config / running MKE3 config |
+| `terraform/mke3_credentials.txt` | MKE3 admin login |
+| `terraform/registry_credentials.txt`, `registry_ca.crt` | Bastion Harbor login and CA (airgap) |
+| `terraform/msr4_credentials.txt`, `msr4_*.crt/.key`, `msr4_redis_password.txt` | MSR4 admin login and TLS PKI |
+| `terraform/k0rdent_ui_credentials.txt` | k0rdent UI login |
+| `~/.mke/mke.kubeconf` | MKE4k kubeconfig |
