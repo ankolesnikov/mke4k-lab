@@ -61,6 +61,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /mke4k-lab
 
 ENV HOME=/root \
+    MKE4K_LAB_CONTAINER=1 \
     PATH=/usr/local/bin:$PATH
 
 # Runtime packages (AWS-only: no Azure CLI, no OpenStack)

@@ -4,6 +4,7 @@
 .expiry-base
 .mke/
 .mirantis-launchpad/
+.aws/
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/
