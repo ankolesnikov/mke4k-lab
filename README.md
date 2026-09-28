@@ -430,7 +430,7 @@ t destroy kof
 
 MKE4k ships the k0rdent Enterprise UI (service `kcm-k0rdent-ui` in namespace `k0rdent`) as ClusterIP-only with a fixed default basic-auth password. With `k0rdent_ui_enabled=true` (required — the command dies otherwise), `t deploy k0rdent-ui`:
 
-1. Runs `terraform apply` to add an NLB listener (`k0rdent_ui_lb_port`, default `8445`) + a security-group rule for a pinned Envoy NodePort (`k0rdent_ui_nodeport`, default `33003`). Idempotent; preserves the deployed mke3/airgap topology.
+1. Runs `terraform apply` to add an NLB listener (`k0rdent_ui_lb_port`, default `8445`) + target group forwarding to a pinned Envoy NodePort (`k0rdent_ui_nodeport`, default `33003`). Idempotent; preserves the deployed mke3/airgap topology. (The security-group rules for both ports are always present.)
 2. Rotates the UI password to a random value by patching `Management/kcm` (`spec.core.kcm.config.k0rdent-ui.auth.basic`) and waits for the rollout. Credentials are saved to `terraform/k0rdent_ui_credentials.txt` (user `admin`) and reused on later runs.
 3. Applies `k0rdent-ui/k0rdent-ui-gateway.yaml` (self-signed `Issuer`/`Certificate` + `EnvoyProxy`/`Gateway`/`HTTPRoute` in namespace `k0rdent`). Cert SANs = NLB DNS + node IPs. In airgap the Envoy data-plane image is pinned to MKE's own envoy image so it pulls from Harbor.
 
@@ -438,7 +438,7 @@ It runs automatically at the end of `t deploy lab` / `t deploy lab airgap` when 
 
 **Access:** online `https://<nlb-dns>:8445` or `https://<node-public-ip>:33003`; airgap `t tunnel k0rdent-ui` → `https://localhost:8445` (needs `-p 8445:8445`). The login is printed at the end of the deploy.
 
-`t destroy k0rdent-ui` deletes only the gateway resources. The rotated password stays in `Management/kcm`, and the NLB listener stays until you set `k0rdent_ui_enabled=false` and re-run the `t deploy instances` variant that matches your lab (e.g. `t deploy instances airgap`) — the plain variant would rewrite tfvars for an online MKE4k topology.
+`t destroy k0rdent-ui` deletes the gateway resources, then removes the NLB listener + target group with a **targeted** `terraform destroy` (the cluster is never touched). The rotated password stays in `Management/kcm`. Set `k0rdent_ui_enabled=false` in `config` as well — otherwise the next full terraform apply (`t deploy lab`, online `t deploy kof`, ...) recreates the listener.
 
 ### Auto-expiry
 
@@ -520,7 +520,7 @@ Each tunnel needs the matching `-p` mapping on `docker run`. `t tunnel` with no 
 
 | Command | Description |
 |---|---|
-| `t status` | Show cluster node status (`kubectl get nodes` with `~/.mke/mke.kubeconf`). MKE4k online only — see note below |
+| `t status` | Show cluster node status (`kubectl get nodes -o wide`). Works in all modes: airgap runs it on the bastion; MKE3 uses the launchpad client bundle |
 | `t show nodes` | Print IPs and NLB DNS name |
 | `t show summary` | Reprint the deploy summary box (credentials, URLs, IPs, expiry) |
 | `t gen client-bundle [mke3]` | MKE3: download the admin client bundle (`cd <dir> && source env.sh`); in airgap it is generated on the bastion |
@@ -532,7 +532,7 @@ Each tunnel needs the matching `-p` mapping on `docker run`. `t tunnel` with no 
 | `t connect <node> "cmd"` | Run a single command on a node |
 | `t connect <ip>` | SSH to any raw IP or hostname |
 
-> **`t status` limits:** it uses the local `~/.mke/mke.kubeconf`. In airgap that kubeconfig points at the internal NLB, which the container can't reach — use `t connect bastion` and run `kubectl` there (`KUBECONFIG=~/.mke/mke.kubeconf`), or forward 6443 as shown by `t tunnel`. For MKE3 use the client bundle (`t gen client-bundle`).
+> **Local `kubectl` in airgap:** the copied `~/.mke/mke.kubeconf` points at the internal NLB, which the container can't reach. `t status` handles this by running on the bastion; for your own `kubectl` commands, use `t connect bastion` (`KUBECONFIG=~/.mke/mke.kubeconf`) or forward 6443 as shown by `t tunnel`. For MKE3, use the client bundle (`t gen client-bundle`).
 
 **Container shell extras** (`.bashrc`): `connect m1` works as a shortcut for `t connect m1`; `k` = `kubectl`, `h` = `helm`; `KUBECONFIG` is set automatically once `~/.mke/mke.kubeconf` exists; `config` is sourced so its variables are available in the shell.
 
@@ -574,7 +574,7 @@ mke4k-lab/
 | `aws_vpc` + `aws_internet_gateway` | Dedicated VPC (`172.31.0.0/16`) with IGW — full isolation per lab |
 | `aws_subnet` (public) | `172.31.0.0/24` with `map_public_ip_on_launch` |
 | `tls_private_key` + `aws_key_pair` | RSA-4096 key pair, PEM saved to `terraform/aws_private.pem` |
-| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001 (ingress), 33443 (MSR4), 30080, `kof_grafana_nodeport` (33002) + `k0rdent_ui_nodeport` (33003) when enabled, + intra-cluster |
+| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001 (ingress), 33443 (MSR4), 30080, `kof_grafana_nodeport` (33002), `k0rdent_ui_nodeport` (33003) + intra-cluster. The Grafana / k0rdent UI ports are always open, whether or not the feature is enabled |
 | `aws_instance` (controllers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.xlarge` (configurable), 50GB gp3 |
 | `aws_instance` (workers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.large` (configurable), 50GB gp3 |
 | `aws_lb` (NLB) | Public NLB in public subnet (internal in airgap) |
