@@ -3,6 +3,11 @@
 # Usage: t <command> [subcommand]
 set -euo pipefail
 
+if [[ "${MKE4K_LAB_CONTAINER:-}" != "1" ]]; then
+    printf 't must run inside the MKE4 Lab container. Start it with the run.sh launcher.\n' >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve project root (directory containing 'config')
 # ---------------------------------------------------------------------------
@@ -6921,7 +6926,7 @@ usage() {
     echo "  tunnel grafana              KOF Grafana     → https://localhost:8443"
     echo ""
     echo "Prerequisites:"
-    echo "  - AWS credentials exported (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
+    echo "  - AWS access via a selected SSO profile or credentials inside the container"
     echo "  - terraform, mkectl, kubectl, jq in PATH"
     echo "  - Edit 'config' before deploying"
     echo ""

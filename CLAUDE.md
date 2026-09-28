@@ -9,26 +9,23 @@ A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https
 ## Usage (Docker — recommended)
 
 ```bash
-# Build (pre-initialises Terraform providers)
-docker build -t mke4k-lab .
+# First-time AWS SSO configuration (project-private .aws mount)
+./run.sh --sso-configure
+./run.sh --aws-profile my-lab --sso-login
 
-# Run (pass AWS credentials via env)
-docker run -it --name mke4k-lab \
-  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  mke4k-lab
+# Enter a new container with persistent Terraform state, generated files, and SSO cache
+./run.sh --aws-profile my-lab
+# Verify the selected account before deployment: aws sts get-caller-identity
 
-# Run with port mappings for airgap UI tunnels
+# Manual alternative (no persistent mounts; state lives in the named container).
 #   3000 = MKE4k/MKE3 Dashboard, 8443 = KOF Grafana, 8444 = MSR4, 8445 = k0rdent UI
 docker run -it --name mke4k-lab \
-  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
   -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
-  mke4k-lab
-
-# Re-attach (state lives inside the container)
-docker start -ai mke4k-lab
+  registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+docker start -ai mke4k-lab   # re-attach
 ```
+
+`run.sh` uses the prebuilt image; Dockerfile builds set the same container marker. `t` is intentionally blocked on the host, and `run.sh` does not forward host static AWS access keys. The launcher can be invoked through a PATH symlink. See README for manual image builds and Bash argument passthrough.
 
 Inside the container, the `t` command is available globally:
 
@@ -82,6 +79,7 @@ t deploy nfs [mke3]       # NFS server + provisioner on an existing cluster (aut
 t expiry                  # Show the current auto-expiry deadline
 t expiry 5                # Re-arm auto-expiry to 5 days from now (targeted apply; cluster untouched)
 t expiry off              # Disable auto-expiry (removes the reaper; lab won't self-delete)
+t expiry status           # Local-only expiry banner (no AWS creds; also printed on shell start)
 t status                  # kubectl get nodes (airgap: on the bastion; MKE3: via client bundle)
 t show nodes              # Print IPs + NLB DNS
 t show summary            # Reprint the deploy summary box (credentials, URLs, IPs)
@@ -101,16 +99,9 @@ t tunnel k0rdent-ui       # k0rdent UI       → https://localhost:8445
 t tunnel grafana          # KOF Grafana      → https://localhost:8443
 ```
 
-## Usage (Local)
+## Host usage
 
-Prerequisites: `terraform` ≥ 0.14.3, `kubectl`, `helm` v3, `jq`, `yq` v4, `openssl`, `aws` CLI (cleanup script only), AWS credentials exported. `mkectl` and `launchpad` are auto-downloaded.
-
-```bash
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-vi config            # edit cluster settings
-./bin/t deploy lab
-```
+Edit `config` on the host if convenient, but run every `t` command inside the container. `bin/t-commandline.bash` rejects host execution (no `MKE4K_LAB_CONTAINER=1`) before loading configuration or touching Terraform state. The image ships everything `t` needs: `terraform` ≥ 0.14.3, `kubectl`, `helm` v3, `jq`, `yq` v4, `openssl`, `aws` CLI; `mkectl` and `launchpad` are auto-downloaded. On the host you only need `docker` (plus the `aws` CLI for `bin/cleanup-aws.sh`).
 
 ## Configuration
 
@@ -212,12 +203,15 @@ Edit `config` before deploying. Key variables:
 - **`terraform/nfs.tf`** — NFS server EC2 (Ubuntu; public subnet online, private in airgap); gated by `nfs_enabled`
 - **`kof/`** — committed KOF assets: `global-values.yaml` (image repoint), `grafana.yaml` (instance CR), `grafana-gateway.yaml` (Envoy gateway), `mke-prometheus-datasource.yaml`, `profiles/{full,lean}.yaml`
 - **`k0rdent-ui/k0rdent-ui-gateway.yaml`** — Issuer/Certificate/EnvoyProxy/Gateway/HTTPRoute for the k0rdent UI (namespace `k0rdent`); NodePort + cert SANs are patched in by `k0rdent_ui_install_gateway`
-- **`.bashrc`** — container shell: `connect` shortcut for `t connect`, `k`/`h` aliases, sources `config`, sets `KUBECONFIG` once `~/.mke/mke.kubeconf` exists
+- **`.bashrc`** — container shell: `connect` shortcut for `t connect`, `k`/`h` aliases, sources `config`, sets `KUBECONFIG` once `~/.mke/mke.kubeconf` exists, prints `t expiry status` on start (`run.sh` mounts it read-only so older images get the banner too)
+- **`run.sh`** — host launcher (the only supported way to run `t` with persistent state): `docker run --rm` of the prebuilt image with the checkout, `.mke`, `.mirantis-launchpad`, a private `.aws` (mode 700, symlinks refused) and `.bashrc` bind-mounted, ports 3000/8443/8444/8445, `MKE4K_LAB_CONTAINER=1`; `--sso-configure` / `--aws-profile NAME [--sso-login]` for AWS IAM Identity Center (device code). Never forwards host static AWS keys
+- **`tests/`** — offline regression scripts: `test_container_launcher.sh` (run.sh args/mounts + host guard, with `mock_docker.sh`) and `test_expiry_status.sh` (`t expiry status` states with a mocked `terraform`; GNU `date`, so run in the container)
+- **`TODO.md` / `improvements.md`** — backlog of proposed work / log of changes beyond upstream
 - **`Dockerfile`** — two-stage build (`--platform=linux/amd64`); stage 1 downloads kubectl/helm/terraform/k9s/yq; stage 2 is the runtime image with `t` symlinked globally and Terraform providers pre-initialised
 
 ### State files (live in `terraform/`)
 
-- `terraform.tfstate` — created by `terraform apply`; stays inside the container
+- `terraform.tfstate` — created by `terraform apply`; with `run.sh` it lives in the host checkout (bind mount), with a bare `docker run` only inside that container
 - `aws_private.pem` — written by Terraform (`local_file` resource); used for SSH and embedded in `mke4.yaml`
 - `mke4.yaml` — generated by `generate_mke4_yaml` after apply; also **overwritten** by `t config get [mke4]` / `fetch_current_mke4_yaml` (which MSR4 and KOF already call)
 - `mke3-config.toml` / `.bak` — written by `t config get mke3`; the `.bak` is a fresh copy of the *running* config taken just before an apply

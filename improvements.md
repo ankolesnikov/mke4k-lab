@@ -2,6 +2,24 @@
 
 A running log of notable changes made to this repo beyond the upstream baseline, newest first.
 
+## Container-only `t`, AWS SSO, and PATH-safe launcher
+
+**Date:** 2026-09-28
+
+**Files:** `bin/t-commandline.bash`, `run.sh`, `Dockerfile`, `.gitignore`, `.dockerignore`, `README.md`, `CLAUDE.md`, `tests/`
+
+- `t` now rejects host execution before doing work. `run.sh` marks the current prebuilt container; future image builds include the same marker.
+- `run.sh` supports a private, persistent AWS SSO directory, explicit profile setup/login, and symlink-safe invocation without forwarding host static keys.
+- Added guard and launcher regression tests and updated container-only usage documentation.
+
+## One-command container startup
+
+**Date:** 2026-09-28
+
+**Files:** `run.sh`, `README.md`
+
+- Added `run.sh` to start the prebuilt image with the persistent project, MKE4k kubeconfig, MKE3 client bundle, and shell startup mounts plus UI tunnel ports. It resolves the checkout from its own location and works from another current directory.
+
 ## Persistent workspace and expiry status
 
 **Date:** 2026-09-28

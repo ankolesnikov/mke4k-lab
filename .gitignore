@@ -4,6 +4,7 @@
 .expiry-base
 .mke/
 .mirantis-launchpad/
+.aws/
 .claude
 .DS_Store
 mke3/

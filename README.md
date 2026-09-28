@@ -24,30 +24,29 @@ docker run -it --name mke4k-lab \
   registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
 ```
 
-> **AWS credentials** — you don't have to pass them at `docker run` time. Once inside the container just export them in the shell:
-> ```bash
-> export AWS_ACCESS_KEY_ID="..."
-> export AWS_SECRET_ACCESS_KEY="..."
-> ```
-> If you'd rather inject them up front, add `-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY` to the `docker run` command (passes them through from your host env).
+For a persistent workspace and AWS SSO instead of static access keys, use `run.sh` below. The bare `docker run` examples do not mount the checkout or an AWS SSO cache.
 
 > The bastion's Harbor registry UI is reachable directly at `https://<bastion-public-ip>` (the bastion has a public IP and the SG opens 443), so no port mapping or tunnel is needed for it.
 
-To keep Terraform state, generated SSH keys, manifests, credentials, and client configuration on the host, run from a checkout of this repository with bind mounts:
+To keep Terraform state, generated SSH keys, manifests, credentials, and client configuration on the host, run this script from a checkout of this repository (it also works when called from another directory):
 
 ```bash
-LAB_DIR="$(pwd)"
-mkdir -p "${LAB_DIR}/.mke" "${LAB_DIR}/.mirantis-launchpad"
-docker run --rm -it \
-  -v "${LAB_DIR}:/mke4k-lab" \
-  -v "${LAB_DIR}/.mke:/root/.mke" \
-  -v "${LAB_DIR}/.mirantis-launchpad:/root/.mirantis-launchpad" \
-  -v "${LAB_DIR}/.bashrc:/root/.bashrc:ro" \
-  -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
-  registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+./run.sh
 ```
 
-The project mount preserves `terraform/terraform.tfstate` and generated files; `.mke` preserves the MKE4k kubeconfig, and `.mirantis-launchpad` preserves the online MKE3 client bundle. The `.bashrc` mount enables the local `t expiry status` banner even when using an older prebuilt image. The host checkout supplies `bin/t-commandline.bash`, so update the checkout along with the image. A fresh checkout needs `terraform init`, which `t deploy lab` runs before applying. Export AWS credentials in each new shell session. `--rm` removes only the container after exit, while the bind-mounted files remain on the host.
+`run.sh` creates private host directories for `.mke`, `.mirantis-launchpad`, and `.aws`, mounts them and the checkout into the container, and publishes ports 3000, 8443, 8444, and 8445 for UI tunnels. The project mount preserves Terraform state, generated SSH keys, and manifests; `.mke` preserves the MKE4k kubeconfig, `.mirantis-launchpad` preserves the online MKE3 client bundle, and `.aws` preserves the lab's AWS SSO configuration and login cache. The `.aws` directory is excluded from Git and Docker builds; its cached tokens are sensitive. The `.bashrc` mount enables the local `t expiry status` banner even with an older prebuilt image. The host checkout supplies `bin/t-commandline.bash`, so update the checkout along with the image. A fresh checkout needs `terraform init`, which `t deploy lab` runs before applying. The container is removed after exit, while the bind-mounted files remain on the host.
+
+To use AWS IAM Identity Center, configure a named profile once, then log in using the device code in your host browser:
+
+```bash
+./run.sh --sso-configure                         # choose an SSO session, account, role, and profile name
+./run.sh --aws-profile my-lab --sso-login        # open the displayed URL on the host and enter its code
+./run.sh --aws-profile my-lab                    # later sessions use the saved profile and cache
+# Inside the container, before deployment:
+aws sts get-caller-identity
+```
+
+Use the profile name chosen during configuration in place of `my-lab`. Login is explicit, not repeated automatically on every launch. `run.sh` never forwards static AWS access-key variables from the host. `t` commands refuse to run on the host; use the container. The launcher also works through a symlink placed in your `PATH`. To pass Bash arguments, use `./run.sh --aws-profile my-lab -- -lc 'your command'`. AWS documents the [SSO configuration and device-code login flow](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html).
 
 ### Option B — Build the Docker image yourself
 
@@ -65,12 +64,10 @@ docker run -it --name mke4k-lab \
   mke4k-lab
 ```
 
-As with Option A, export `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` inside the container (or pass `-e` at `docker run` time).
+The manual `docker run` examples do not have the persistent `.aws` mount. Use `run.sh` for the SSO workflow above.
 
 Once inside the container:
 ```bash
-export AWS_ACCESS_KEY_ID="..."        # if not already passed via -e on docker run
-export AWS_SECRET_ACCESS_KEY="..."
 vi /mke4k-lab/config      # edit cluster settings
 t deploy lab              # MKE4k: provision EC2 + NLB, then install
 t deploy lab mke3         # MKE3:  provision + launchpad apply
@@ -91,19 +88,9 @@ docker cp mke4k-lab:/mke4k-lab/terraform/aws_private.pem .
 docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
 ```
 
-### Option C — Local (requires tools installed)
+### Configure and deploy from the container
 
-#### Prerequisites
-
-- AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- `terraform` >= 0.14.3
-- `kubectl`
-- `helm` v3 (NFS provisioner, MSR4, KOF — helm v4 is not supported by KOF)
-- `jq`, `yq` (mikefarah v4), `openssl`, `ssh`/`scp`
-- `aws` CLI v2 (only for `bin/cleanup-aws.sh`)
-- `mkectl` and `launchpad` are downloaded automatically at the versions set in `config`
-
-### 1. Edit config
+Edit `config` in the host checkout or inside the container:
 
 ```bash
 vi config
@@ -122,17 +109,10 @@ os_name="ubuntu"               # cluster node OS: ubuntu or redhat
 os_version="22.04"             # ubuntu: 22.04/24.04 | redhat: 9.6/8.10
 ```
 
-### 2. Export AWS credentials
+Then start the container with `./run.sh --aws-profile my-lab` and deploy inside it:
 
 ```bash
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-```
-
-### 3. Deploy
-
-```bash
-./bin/t deploy lab
+t deploy lab
 ```
 
 This will:
@@ -145,7 +125,7 @@ This will:
 
 ## Recipes
 
-Each recipe is just **(1) a handful of edits in `config`** + **(2) one command**. All of them assume you're already inside the container (`docker start -ai mke4k-lab`) with AWS credentials exported. Only the lines that differ from the shipped `config` are shown.
+Each recipe is just **(1) a handful of edits in `config`** + **(2) one command**. All of them assume you're already inside a container with a valid AWS profile or credentials. Only the lines that differ from the shipped `config` are shown.
 
 ### Deploy MKE4k v4.2.0 (online)
 

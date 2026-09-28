@@ -6,6 +6,7 @@ test_dir="$(mktemp -d /tmp/mke4-expiry-test.XXXXXX)"
 trap 'rm -r "${test_dir}"' EXIT
 mkdir -p "${test_dir}/bin" "${test_dir}/terraform"
 cp "${repo_root}/bin/t-commandline.bash" "${test_dir}/bin/t-commandline.bash"
+export MKE4K_LAB_CONTAINER=1
 
 terraform() {
     [[ "$*" == *" output -json" ]] || return 2
