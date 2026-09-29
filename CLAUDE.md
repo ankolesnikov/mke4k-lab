@@ -119,7 +119,7 @@ Edit `config` before deploying. Key variables:
 | `nfs_enabled` | `true` | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA). Works in all modes incl. MKE3: MKE3 kubeconfig comes from the launchpad client bundle (`source env.sh`) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
 | `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |
-| `kof_version` | `1.8.1` | KOF umbrella chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. See *KOF values layering* |
+| `kof_version` | `1.8.1` | KOF umbrella chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. These are the **only tested and validated** versions; any other is untested. See *KOF values layering* |
 | `kof_mode` | `lean` | KOF scope: `full` (observability + FinOps) or `lean` (cluster monitoring only). Grafana + HTTPS gateway and MKE-monitoring reuse are on by default (advanced settings) |
 | `airgap_registry_flavor` | `t3.xlarge` | Bastion/registry instance type |
 | `airgap_registry_disk_gb` | `100` | Bastion root volume size (holds Harbor + image bundle) |
