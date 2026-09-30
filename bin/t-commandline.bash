@@ -4733,6 +4733,18 @@ cmd_deploy_kof() {
       | .["kof-storage"].values["victoria-traces-multilevel-select"].enabled = (strenv(TRACES_ON) == "true")
     ' runtime.yaml
 
+    # KOF 1.4.x adds an audit-logs VictoriaLogs cluster (kof-storage
+    # victoriametrics.vlcluster_audit -> VLCluster/audit-logs, fed by the collectors'
+    # otlphttp/logs-audit exporter). Its vlstorage PVCs default to 2 x 100Gi and are
+    # NOT covered by the global-values size edit above (different key), so size them
+    # with the same kof_storage_size. StorageClass already follows kof-storage
+    # global.storageClass (the chart copies it in). KOF 1.8.x has no vlcluster_audit,
+    # so this is a no-op there. NOTE: STS volumeClaimTemplates are immutable and PVCs
+    # can't shrink — on an existing install the old PVC size stays until redeploy.
+    SIZE="${kof_storage_size}" yq -i '
+        .["kof-storage"].values.victoriametrics.vlcluster_audit.spec.vlstorage.storage.volumeClaimTemplate.spec.resources.requests.storage = strenv(SIZE)
+    ' runtime.yaml
+
     # NOTE: MKE4k is k0s and KOF's default PKI_PATH is already var/lib/k0s, so NO
     # collector env override (PKI_PATH) is needed here. Only non-k0s clusters
     # (e.g. kind -> etc/kubernetes) require it.

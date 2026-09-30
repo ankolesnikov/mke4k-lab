@@ -163,7 +163,8 @@ msr4_storage_size="10Gi"
 # Any other KOF version is untested: the charts change between releases in
 # ways that silently break the M2M setup (see CLAUDE.md "KOF values layering").
 kof_version="1.8.1"
-# PVC size for VictoriaMetrics / VictoriaLogs / VictoriaTraces (doc default 100Gi).
+# PVC size for VictoriaMetrics / VictoriaLogs / VictoriaTraces (doc default 100Gi),
+# and on KOF 1.4.x also the audit-logs VictoriaLogs cluster (chart default 2 x 100Gi).
 kof_storage_size="10Gi"
 # Image/chart registry. Leave default: in airgap it is auto-derived to
 # <registry_hostname>/mke (where the MKE bundle upload lands the KOF artifacts).
