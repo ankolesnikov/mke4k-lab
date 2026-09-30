@@ -1,0 +1,40 @@
+# KOF 1.4.x-only values overlay (k0rdent Enterprise 1.4.x / MKE 4.2.1).
+# ---------------------------------------------------------------------------
+# Applied by 't deploy kof' ONLY when kof_version matches 1.4.* — i.e. after the
+# profile and before the runtime overlay in the helm -f chain. KOF 1.8.x has no
+# overlay file, so nothing here can affect it. Put a fix here (instead of the
+# version-agnostic files) whenever it would change what 1.8.x renders.
+#
+# Host syslog (and with it the k0s `component` field) is DROPPED by VictoriaLogs
+# v1.50.0 (KOF 1.4.x; 1.8.x ships v1.43.1, which accepted it):
+#   cannot unmarshal streamTagsCanonical: unexpected value for the stream tag
+#   "host.name"; got "ip-172-31-0-88"; want "kof-collectors-daemon-collector-…"
+#   ... skipping the log entry
+# The chart's transform/syslog copies the syslog line's hostname into the LOG
+# attribute host.name, while the RESOURCE attribute host.name (a VictoriaLogs
+# stream field) is the collector pod name; v1.50.0's cluster vlstorage rejects the
+# conflicting duplicate. Fix: the chart's own transform/syslog statements
+# verbatim, except keep_keys no longer keeps host.name (the node is still on every
+# record as k8s.node.name, which is what the dashboards filter on).
+kof-collectors:
+  values:
+    opentelemetry-kube-stack:
+      collectors:
+        daemon:
+          config:
+            processors:
+              transform/syslog:
+                error_mode: ignore
+                log_statements:
+                  - context: log
+                    conditions:
+                      - attributes["log.file.path"] == "/hostfs/var/log/syslog"
+                    statements:
+                      - merge_maps(log.cache, ExtractGrokPatterns(log.body, "%{SYSLOGLINE}", false), "upsert")
+                      - merge_maps(log.cache, ExtractGrokPatterns(log.body, "%{(TIMESTAMP_ISO8601|SYSLOGTIMESTAMP):timestamp} %{SYSLOGHOST:host.name} (%{SYSLOGPROG}:)?\\s*%{GREEDYDATA:message}", false, ["GREEDYMULTILINE=(.|\\n)*"]), "upsert")
+                      - merge_maps(log.cache, ExtractGrokPatterns(log.cache["SYSLOGPROG"], "%{DATA:process.executable.name}(?:\\[%{POSINT:process.pid})\\]", true), "upsert") where log.cache["SYSLOGPROG"] != nil
+                      - set(log.body, log.cache["message"])
+                      - set(log.attributes["syslog.timestamp"], log.cache["timestamp"])
+                      - set(log.attributes["syslog.facility"], log.cache["SYSLOGFACILITY"])
+                      - keep_keys(log.cache, ["process.pid", "process.executable.name"])
+                      - merge_maps(log.attributes, log.cache, "upsert")

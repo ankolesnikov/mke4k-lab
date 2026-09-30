@@ -4049,6 +4049,8 @@ kof_preflight() {
         || die "Cluster not reachable (mode=${_kof_mode}). Deploy the cluster first."
     [[ -f "${PROJECT_ROOT}/kof/global-values.yaml" ]] \
         || die "Missing committed asset ${PROJECT_ROOT}/kof/global-values.yaml."
+    [[ -f "${PROJECT_ROOT}/kof/umbrella-defaults.yaml" ]] \
+        || die "Missing committed asset ${PROJECT_ROOT}/kof/umbrella-defaults.yaml."
     [[ -f "${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml" ]] \
         || die "Missing KOF profile asset ${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml (kof_mode=${kof_mode})."
     [[ "${kof_grafana_enabled}" != "true" || -f "${PROJECT_ROOT}/kof/grafana.yaml" ]] \
@@ -4489,7 +4491,7 @@ kof_install_grafana_gateway() {
 
 # Install the KOF umbrella chart from the generated values files in the CURRENT
 # directory (cmd_deploy_kof's workdir). Online: helm runs locally, byte-identical
-# to the original inline invocation. Airgap: the three values files are scp'd to
+# to the original inline invocation. Airgap: the five values files are scp'd to
 # the bastion and helm runs there (kof_bastion_prep guaranteed helm + CA trust;
 # the 'mke' Harbor project is public so the OCI pull needs no login).
 kof_helm_install() {
@@ -4498,14 +4500,16 @@ kof_helm_install() {
         local rdir="/tmp/$(basename "$(pwd)")"    # kof-XXXX — unique per run
         ssh_node "${_kof_ssh_key}" "${_kof_bastion_ip}" "mkdir -p '${rdir}'"
         scp -q -o StrictHostKeyChecking=no -i "${_kof_ssh_key}" \
-            global-components.yaml profile.yaml runtime.yaml \
+            umbrella-defaults.yaml global-components.yaml profile.yaml version.yaml runtime.yaml \
             "ubuntu@${_kof_bastion_ip}:${rdir}/"
         _kof_kexec "cd '${rdir}' && helm upgrade -i --reset-values --wait \
             --create-namespace -n kof kof \
             'oci://${kof_registry}/charts/kof' \
             --version '${kof_version}' \
+            -f umbrella-defaults.yaml \
             -f global-components.yaml \
             -f profile.yaml \
+            -f version.yaml \
             -f runtime.yaml \
             && cd / && rm -rf '${rdir}'"
     else
@@ -4513,8 +4517,10 @@ kof_helm_install() {
             --create-namespace -n kof kof \
             "oci://${kof_registry}/charts/kof" \
             --version "${kof_version}" \
+            -f umbrella-defaults.yaml \
             -f global-components.yaml \
             -f profile.yaml \
+            -f version.yaml \
             -f runtime.yaml
     fi
     return 0
@@ -4605,6 +4611,19 @@ cmd_deploy_kof() {
 
     cp "${PROJECT_ROOT}/kof/global-values.yaml" "${workdir}/global-values.yaml"
     cp "${PROJECT_ROOT}/kof/profiles/${kof_mode}.yaml" "${workdir}/profile.yaml"
+    # Upstream (1.8.x umbrella) baseline for kof-storage/kof-collectors — see the
+    # file header; passed first to helm so everything else overrides it.
+    cp "${PROJECT_ROOT}/kof/umbrella-defaults.yaml" "${workdir}/umbrella-defaults.yaml"
+    # Version-scoped fixes (kof/version-overrides/<major.minor>.yaml, e.g. 1.4.yaml
+    # for kof_version=1.4.1). Only for fixes that would CHANGE what another KOF
+    # version renders; absent file -> empty overlay, so e.g. 1.8.x is untouched.
+    local kof_mm="${kof_version#v}"; kof_mm="${kof_mm%.*}"
+    if [[ -f "${PROJECT_ROOT}/kof/version-overrides/${kof_mm}.yaml" ]]; then
+        info "Applying KOF ${kof_mm}.x version overlay (kof/version-overrides/${kof_mm}.yaml)..."
+        cp "${PROJECT_ROOT}/kof/version-overrides/${kof_mm}.yaml" "${workdir}/version.yaml"
+    else
+        echo '{}' > "${workdir}/version.yaml"
+    fi
     cd "${workdir}"
 
     # Airgap seam (no-op online): repoint every image to a custom registry.
@@ -4627,6 +4646,7 @@ cmd_deploy_kof() {
           | .["cert-manager-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
           | .["envoy-gateway-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
           | .["ingress-nginx-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
+          | .["victoria-metrics-operator-service-template"].repo.spec.certSecretRef.name = "kof-registry-cert"
           | .["k0rdent-istio"].repo.spec.certSecretRef.name = "kof-registry-cert"
           | .istio.repo.spec.certSecretRef.name = "kof-registry-cert"
         ' global-values.yaml
@@ -4665,8 +4685,13 @@ cmd_deploy_kof() {
     #   - global.helmRepo.namespace            : umbrella Flux HelmRepository/HelmChart
     #   - kof-mothership.values.kcm.namespace   : KCM integration
     #   - kof-mothership.values.*-service-template.namespace : kgst hooks create a
-    #     Flux HelmRepository per ServiceTemplate (cert-manager/ingress-nginx/envoy)
+    #     Flux HelmRepository per ServiceTemplate (cert-manager/ingress-nginx/envoy,
+    #     plus victoria-metrics-operator on the KOF 1.4.x line; unknown keys are
+    #     ignored by charts that lack the subchart, so this is safe on 1.8.x)
     #   - kof-collectors.values.kcm.namespace + global.clusterNamespace
+    # Plus the M2M cluster identity "mothership" (collector labels below; and
+    # kof-storage global.clusterName, which KOF 1.4.x uses as the promxy
+    # server-group cluster_name — chart default "storage"; 1.8.x hardcodes it)
     # The component SCOPE (what's enabled, the prometheus-node-exporter :9100 fix,
     # the kof-regional/kof-child M2M disable, cluster identity) now lives in the
     # editable kof/profiles/<mode>.yaml overlay copied above — edit that to tune
@@ -4678,7 +4703,9 @@ cmd_deploy_kof() {
       | .["kof-mothership"].values["cert-manager-service-template"].namespace = strenv(KCM_NS)
       | .["kof-mothership"].values["ingress-nginx-service-template"].namespace = strenv(KCM_NS)
       | .["kof-mothership"].values["envoy-gateway-service-template"].namespace = strenv(KCM_NS)
+      | .["kof-mothership"].values["victoria-metrics-operator-service-template"].namespace = strenv(KCM_NS)
       | .["kof-storage"].values.global.storageClass = strenv(SC)
+      | .["kof-storage"].values.global.clusterName = "mothership"
       | .["kof-collectors"].values.kcm.namespace = strenv(KCM_NS)
       | .["kof-collectors"].values.global.clusterNamespace = strenv(KCM_NS)
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.processors["resource/k8sclustername"].attributes = [
@@ -4688,6 +4715,36 @@ cmd_deploy_kof() {
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.cluster = "mothership"
       | .["kof-collectors"].values["opentelemetry-kube-stack"].defaultCRConfig.config.exporters.prometheusremotewrite.external_labels.clusterNamespace = strenv(KCM_NS)
     ' > runtime.yaml
+    # KOF 1.4.x read path for logs/traces: the mothership's Grafana datasources
+    # query multilevel selects (VLCluster kof-mothership-logs-multilevel-select,
+    # VTCluster kof-mothership-multilevel-select) whose storage nodes are wired
+    # by kof-operator from VMStorageConnection CRs. kof-storage renders those
+    # connections (logs + audit-logs, traces) only when its own
+    # victoria-{logs,traces}-multilevel-select.enabled is set — default false,
+    # so without this kof-logs/kof-traces query nothing (empty Logs dashboards).
+    # The traces connection follows the profile's traces storage (lean drops it;
+    # a connection to a missing vtselect would just be a dead storage node).
+    # KOF 1.8.x has none of these keys/templates (logs go via vlogxy), so this
+    # is a no-op there.
+    local traces_on
+    traces_on="$(yq '.["kof-storage"].values["victoria-traces-cluster"].enabled != false' profile.yaml)"
+    TRACES_ON="${traces_on}" yq -i '
+        .["kof-storage"].values["victoria-logs-multilevel-select"].enabled = true
+      | .["kof-storage"].values["victoria-traces-multilevel-select"].enabled = (strenv(TRACES_ON) == "true")
+    ' runtime.yaml
+
+    # KOF 1.4.x adds an audit-logs VictoriaLogs cluster (kof-storage
+    # victoriametrics.vlcluster_audit -> VLCluster/audit-logs, fed by the collectors'
+    # otlphttp/logs-audit exporter). Its vlstorage PVCs default to 2 x 100Gi and are
+    # NOT covered by the global-values size edit above (different key), so size them
+    # with the same kof_storage_size. StorageClass already follows kof-storage
+    # global.storageClass (the chart copies it in). KOF 1.8.x has no vlcluster_audit,
+    # so this is a no-op there. NOTE: STS volumeClaimTemplates are immutable and PVCs
+    # can't shrink — on an existing install the old PVC size stays until redeploy.
+    SIZE="${kof_storage_size}" yq -i '
+        .["kof-storage"].values.victoriametrics.vlcluster_audit.spec.vlstorage.storage.volumeClaimTemplate.spec.resources.requests.storage = strenv(SIZE)
+    ' runtime.yaml
+
     # NOTE: MKE4k is k0s and KOF's default PKI_PATH is already var/lib/k0s, so NO
     # collector env override (PKI_PATH) is needed here. Only non-k0s clusters
     # (e.g. kind -> etc/kubernetes) require it.
