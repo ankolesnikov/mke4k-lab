@@ -66,7 +66,8 @@ t deploy msr4 airgap      # images/charts mirrored to the bastion Harbor first
 t deploy k0rdent-ui       # terraform (NLB listener + SG) + rotate password + Envoy gateway
 t destroy k0rdent-ui      # delete gateway resources + targeted destroy of the NLB listener/TG (password stays)
 
-# KOF observability (requires MKE 4.2.0+; kof_enabled=true auto-runs it in lab deploys)
+# KOF observability (requires MKE 4.2.0+; kof_version must match the k0rdent release:
+# 1.8.1 on MKE 4.2.0, 1.4.1 on MKE 4.2.1; kof_enabled=true auto-runs it in lab deploys)
 t deploy kof [full|lean]        # Deploy KOF on an existing cluster (online)
 t deploy kof [full|lean] airgap # Deploy KOF from the bastion (charts/images from internal registry)
 t destroy kof                   # helm uninstall + delete ns kof (auto-detects airgap)
@@ -126,6 +127,7 @@ Edit `config` before deploying. Key variables:
 | `nfs_enabled` | `true` (fallback `false` if the line is absent) | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA). Works in all modes incl. MKE3: MKE3 kubeconfig comes from the launchpad client bundle (`source env.sh`) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
 | `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |
+| `kof_version` | `1.8.1` | KOF umbrella chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. These are the **only tested and validated** versions; any other is untested. See *KOF values layering* |
 | `kof_mode` | `lean` | KOF scope: `full` (observability + FinOps) or `lean` (cluster monitoring only). Grafana + HTTPS gateway and MKE-monitoring reuse are on by default (advanced settings) |
 | `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI (rotated password + Envoy gateway, NodePort `k0rdent_ui_nodeport`=33003, NLB `k0rdent_ui_lb_port`=8445) at the end of `t deploy lab`/`lab airgap`; required by `t deploy k0rdent-ui` |
 | `msr4_enabled` | `false` | Gate for `t deploy msr4 [airgap]` (never auto-run). `msr4_replicas` ≥2 = HA (needs `worker_count >= msr4_replicas`) |
@@ -203,7 +205,7 @@ Edit `config` before deploying. Key variables:
 - **`terraform/reaper.py`** — the reaper Lambda (boto3): non-interactive teardown mirroring `cleanup-aws.sh` — terminates `Cluster`-tagged EC2, deletes NLBs/target groups (matched by the `Cluster` tag via `describe_tags`, never by name alone)/VPC+deps/CCM IAM/key pair, then self-cleans (its own schedule, roles, and function). Best-effort per step; zipped at apply-time by `archive_file` → `terraform/reaper.zip` (git/docker-ignored). Every destructive call funnels through `mutate()`, so `DRY_RUN` (env, from `expiry_dry_run`) guarantees a read-only run that still logs each target. A safety fuse aborts if `CLUSTER_NAME` is empty/<5 chars
 - **`terraform/outputs.tf`** — `lb_dns_name`, `mke3_lb_dns_name`, `controller_ips`, `worker_ips`, `ssh_key_path`, `mkectl_command`, `bastion_public_ip`, `bastion_private_ip`, `controller_private_ips`, `worker_private_ips`, `controller_public_dns`/`worker_public_dns`, `controller_private_dns`/`worker_private_dns`, `nfs_server_private_ip`/`nfs_server_public_ip`, `expiry_time`
 - **`terraform/nfs.tf`** — NFS server EC2 (Ubuntu; public subnet online, private in airgap); gated by `nfs_enabled`
-- **`kof/`** — committed KOF assets: `global-values.yaml` (image repoint), `grafana.yaml` (instance CR), `grafana-gateway.yaml` (Envoy gateway), `mke-prometheus-datasource.yaml`, `profiles/{full,lean}.yaml`
+- **`kof/`** — committed KOF assets: `global-values.yaml` (image repoint), `grafana.yaml` (instance CR), `grafana-gateway.yaml` (Envoy gateway), `mke-prometheus-datasource.yaml`, `profiles/{full,lean}.yaml`, `umbrella-defaults.yaml` + `version-overrides/<major.minor>.yaml` (see *KOF values layering*)
 - **`k0rdent-ui/k0rdent-ui-gateway.yaml`** — Issuer/Certificate/EnvoyProxy/Gateway/HTTPRoute for the k0rdent UI (namespace `k0rdent`); NodePort + cert SANs are patched in by `k0rdent_ui_install_gateway`
 - **`.bashrc`** — container shell: `connect` shortcut for `t connect`, `k`/`h` aliases, sources `config`, sets `KUBECONFIG` once `~/.mke/mke.kubeconf` exists, prints `t expiry status` on start (`run.sh` mounts it read-only so older images get the banner too)
 - **`run.sh`** — host launcher (the only supported way to run `t` with persistent state): `docker run --rm` of the prebuilt image with the checkout, `.mke`, `.mirantis-launchpad`, a private `.aws` (mode 700, symlinks refused) and `.bashrc` bind-mounted, ports 3000/8443/8444/8445, `MKE4K_LAB_CONTAINER=1`; `--sso-configure` / `--aws-profile NAME [--sso-login]` for AWS IAM Identity Center (device code). Never forwards host static AWS keys
@@ -243,6 +245,18 @@ MKE4k ships the k0rdent UI (`svc/kcm-k0rdent-ui:3000`, ns `k0rdent`) ClusterIP-o
 
 - The local `~/.mke/mke.kubeconf` in airgap points at the internal NLB (unreachable from the container). `cmd_status` therefore runs kubectl on the bastion (MKE4k kubeconfig, else MKE3 client bundle); online it prefers the local MKE4k kubeconfig and falls back to the MKE3 client bundle. Other local `kubectl` use in airgap needs a 6443 tunnel.
 - `bin/cleanup-aws.sh` does not delete the expiry reaper (Lambda/schedule/IAM roles); if left, it fires at the deadline and self-cleans.
+
+### KOF values layering (`t deploy kof`)
+
+`cmd_deploy_kof` installs the KOF umbrella chart with a fixed `-f` chain (later files win): `umbrella-defaults.yaml` → `global-components.yaml` → `profile.yaml` → `version.yaml` → `runtime.yaml`.
+
+- **`kof/umbrella-defaults.yaml`** — the KOF **1.8.1** umbrella's `global.components` + `kof-storage`/`kof-collectors` blocks, verbatim. KOF 1.4.x's umbrella has neither, so without it 1.4.x deploys no storage/collectors, and kof-storage falls back to chart defaults: a second `VMCluster/cluster` and no promxy server group, so Grafana shows no data. On 1.8.x it matches the umbrella's own defaults, so it has no effect.
+- **`global-components.yaml`** — generated from `kof/global-values.yaml` (registry/image block fanned out to every component).
+- **`profile.yaml`** — `kof/profiles/<full|lean>.yaml`, the scope overlay.
+- **`version.yaml`** — `kof/version-overrides/<major.minor>.yaml` for the configured `kof_version`, otherwise `{}`. **Only** for fixes that would change what another KOF version renders. `1.4.yaml` drops `host.name` from the chart's `transform/syslog` `keep_keys`: VictoriaLogs v1.50.0 (KOF 1.4.x; 1.8.x ships v1.43.1) otherwise rejects every host-syslog record because its log-level `host.name` conflicts with the resource `host.name` stream tag, and the k0s `component` field is lost with them.
+- **`runtime.yaml`** — generated deploy-time substitutions: the `kof_kcm_namespace` repointing, including the 1.4.x-only `victoria-metrics-operator-service-template`; StorageClass; `mothership` identity (incl. kof-storage `global.clusterName`, the 1.4.x promxy server-group name); 1.4.x multilevel-select `VMStorageConnection`s (logs always, traces when the profile keeps traces storage); Grafana; reuse-MKE drops; alert tuning.
+
+**Invariant:** a change for one KOF version must not alter another version's render. Check with an offline `helm template` diff (HEAD vs working tree) of the umbrella and each component chart. Only randomly generated credentials may differ.
 
 ### Node addressing
 

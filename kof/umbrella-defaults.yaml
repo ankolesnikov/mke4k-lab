@@ -1,0 +1,91 @@
+# KOF umbrella defaults for the single-cluster (M2M) components, copied verbatim
+# from the KOF 1.8.1 umbrella chart (charts/kof values.yaml).
+# ---------------------------------------------------------------------------
+# Why this file exists: the lab installs kof-storage + kof-collectors DIRECTLY
+# on the management cluster as umbrella components. KOF 1.8.x ships them in the
+# umbrella (global.components + a kof-storage/kof-collectors values block), but
+# KOF 1.4.x (k0rdent Enterprise 1.4.x / MKE 4.2.1) has neither. Without this:
+#   - the umbrella renders no HelmRelease for them at all (it iterates
+#     global.components; `enabled: true` on an unlisted component is ignored);
+#   - once listed, kof-storage falls back to its chart defaults, which deploy a
+#     SECOND VictoriaMetrics stack (VMCluster "cluster" — same name as the
+#     mothership's — plus vmauth/vmuser/vmalert) and NO promxy server group, so
+#     promxy (the kof-metrics datasource) has nothing to query -> empty Grafana.
+# On 1.8.x every value here equals the umbrella's own default (no-op).
+#
+# Passed FIRST in the helm -f chain (chart-default position), so the profile
+# (kof/profiles/<mode>.yaml), the global-values fan-out and the deploy-time
+# runtime overlay all still override it. Don't put lab tuning here — this file
+# is the upstream baseline; tune in the profile instead.
+global:
+  components:
+    - kof-operators
+    - kof-mothership
+    - kof-regional
+    - kof-child
+    - kof-storage
+    - kof-collectors
+kof-storage:
+  enabled: false
+  # -- Wait for kof-operators to be ready
+  dependsOn:
+    - kof-operators
+    - kof-mothership
+  # -- Values to pass to kof-storage chart
+  values:
+    global:
+      storageClass: ""
+    victoria-metrics-operator:
+      enabled: false
+    victoriametrics:
+      enabled: false
+      vmcluster:
+        enabled: true
+        spec:
+          retentionPeriod: "30d"
+          replicationFactor: 2
+          vmstorage:
+            replicaCount: 2
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  resources:
+                    requests:
+                      storage: 100Gi
+    victoria-logs-cluster:
+      enabled: true
+      vlstorage:
+        persistentVolume:
+          size: 50Gi
+    victoria-traces-cluster:
+      enabled: true
+      vtstorage:
+        persistentVolume:
+          size: 50Gi
+    promxy:
+      enabled: true
+    vlogxy:
+      enabled: true
+    grafana:
+      enabled: false
+    external-dns:
+      enabled: false
+    dex:
+      enabled: false
+    kof-dashboards:
+      enabled: false
+  notes: "Storage components"
+kof-collectors:
+  enabled: false
+  # -- Wait for kof-storage to be ready
+  dependsOn:
+    - kof-storage
+  # -- Values to pass to kof-collectors chart
+  values:
+    collectors:
+      enabled: true
+    opencost:
+      enabled: true
+    metrics-server:
+      enabled: false
+  notes: "Opentelemetry collectors and OpenCost"

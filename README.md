@@ -738,7 +738,7 @@ t destroy lab
 |---|---|---|
 | `kof_enabled` | `false` | Auto-deploy KOF (self-monitoring/M2M) at the end of `t deploy lab` / `t deploy lab airgap`. Even when `false`, KOF can be deployed later with `t deploy kof` / `t deploy kof airgap`. Requires a StorageClass |
 | `kof_mode` | `lean` | Deployment scope: `full` (complete observability + FinOps platform) or `lean` (cluster monitoring only). Override per-run: `t deploy kof full` / `t deploy kof lean` |
-| `kof_version` | `1.8.1` | KOF Helm umbrella-chart version (matches k0rdent Enterprise 1.3.2 / MKE 4.2.0) |
+| `kof_version` | `1.8.1` | KOF Helm umbrella-chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. Only these two are tested |
 | `kof_storage_size` | `10Gi` | PVC size for the VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes (doc default is 100Gi) |
 | `kof_storage_ha` | `true` | Keep VictoriaMetrics/VictoriaLogs in HA (cluster) topology. Applies to both modes |
 | `kof_registry` | `registry.mirantis.com/k0rdent-enterprise` | Image/chart registry. In airgap it is auto-derived to `<registry-hostname>/mke`; override only for a different custom registry |

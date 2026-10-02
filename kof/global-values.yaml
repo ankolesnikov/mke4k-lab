@@ -43,6 +43,13 @@ ingress-nginx-service-template:
     spec:
       type: oci
       url: oci://registry.mirantis.com/k0rdent-enterprise/charts
+# KOF 1.4.x only (k0rdent Enterprise 1.4.x / MKE 4.2.1); ignored by 1.8.x.
+victoria-metrics-operator-service-template:
+  skipVerifyJob: true
+  repo:
+    spec:
+      type: oci
+      url: oci://registry.mirantis.com/k0rdent-enterprise/charts
 kcm:
   kof:
     acl:
