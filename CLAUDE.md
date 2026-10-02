@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Read `AGENTS.md` first** — it holds the rules for agents (which commands need user approval, secrets, non-TTY gotchas, validation). This file is the architecture reference.
+
 ## What This Is
 
 A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/). Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM; `mkectl apply` installs MKE4k on top. Supports online, MKE3, and fully airgapped deployments (both MKE4k airgap and MKE3 airgap).
