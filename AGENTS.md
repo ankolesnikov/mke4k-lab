@@ -128,6 +128,7 @@ python3 -m py_compile terraform/reaper.py
 bash tests/test_container_launcher.sh                        # run.sh + host guard (mock docker)
 bash tests/test_expiry_status.sh                             # needs GNU date: run in the container
 bash tests/test_lab_local_state.sh                           # needs jq: run in the container
+bash tests/test_child_teardown.sh                            # needs jq: run in the container
 docker build -t mke4k-lab .                                  # if Docker is available
 ```
 
