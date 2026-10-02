@@ -73,7 +73,7 @@ for private_dir in .mke .mirantis-launchpad .aws; do
         exit 1
     fi
 done
-mkdir -m 700 -p "${repo_dir}/.mke" "${repo_dir}/.mirantis-launchpad" "${repo_dir}/.aws"
+mkdir -p "${repo_dir}/.mke" "${repo_dir}/.mirantis-launchpad" "${repo_dir}/.aws"
 chmod 700 "${repo_dir}/.mke" "${repo_dir}/.mirantis-launchpad" "${repo_dir}/.aws"
 
 docker_env=(-e MKE4K_LAB_CONTAINER=1)
