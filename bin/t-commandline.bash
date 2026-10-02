@@ -5530,7 +5530,7 @@ _child_lab_supported() {
 }
 
 # AWS credentials for the CAPA identity: CHILD_AWS_* override the container's.
-# Without static AWS_* keys (run.sh with an SSO profile never forwards them),
+# Without static AWS_* keys (e.g. AWS_PROFILE with an SSO profile in a mounted ~/.aws),
 # fall back to the active profile's resolved credentials; SSO yields temporary
 # ones, which child_preflight warns about.
 _child_aws_creds() {
@@ -5583,7 +5583,7 @@ child_preflight() {
 
     _child_aws_creds
     [[ -n "${_child_key}" && -n "${_child_secret}" ]] \
-        || die "AWS credentials not set. Use an AWS profile (run.sh --aws-profile NAME; SSO login still valid) or export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or CHILD_AWS_ACCESS_KEY_ID/CHILD_AWS_SECRET_ACCESS_KEY)."
+        || die "AWS credentials not set. Use an AWS profile (AWS_PROFILE + ~/.aws; SSO login still valid) or export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or CHILD_AWS_ACCESS_KEY_ID/CHILD_AWS_SECRET_ACCESS_KEY)."
     if [[ -n "${_child_token}" ]]; then
         warn "Temporary AWS credentials (session token) detected. CAPA keeps using them for the child's"
         warn "lifetime: once they expire, export fresh ones and run 't rotate child-creds' (the destroy"
@@ -6072,17 +6072,34 @@ _child_delete() {
     return 1
 }
 
+# 0 = child CRD installed, 1 = not installed, 2 = lookup failed (API/auth error).
+# Only a confirmed "not installed" may be read as "no child clusters".
+_child_crd_state() {
+    local out
+    out="$(kubectl get crd "${CHILD_CRD}" --ignore-not-found -o name 2>/dev/null)" || return 2
+    [[ -n "${out}" ]]
+}
+
 cmd_destroy_child_cluster() {
     load_config
-    local ns="${kof_kcm_namespace}"
+    local ns="${kof_kcm_namespace}" rc=0 left
     _child_lab_supported "$(tf_output 2>/dev/null || true)" \
         || die "Child clusters are only supported on an online MKE4k lab."
     kubectl get nodes --request-timeout=20s >/dev/null 2>&1 || die "Cluster not reachable."
-    if kubectl get crd "${CHILD_CRD}" >/dev/null 2>&1 \
-        && kubectl -n "${ns}" get mkechildconfig "${child_name}" >/dev/null 2>&1; then
-        _child_delete "${child_name}" || die "Child cluster deletion did not finish — re-run 't destroy child-cluster'."
+    _child_crd_state || rc=$?
+    (( rc == 2 )) && die "Could not query CRD ${CHILD_CRD} (API error) — keeping the child record. Re-run when the API answers."
+    if (( rc == 0 )); then
+        # Also catches an interrupted delete: MkeChildConfig gone, but its
+        # ClusterDeployment / CAPI Cluster (and CAPA's AWS resources) still going.
+        left="$(_child_remaining "${child_name}")"
+        [[ "${left}" == "?" ]] && die "Could not list ${child_name}'s k0rdent/CAPI objects (API error) — re-run when the API answers."
+        if [[ -n "${left}" ]]; then
+            _child_delete "${child_name}" || die "Child cluster deletion did not finish — re-run 't destroy child-cluster'."
+        else
+            info "No k0rdent/CAPI objects left for ${child_name} — nothing to delete."
+        fi
     else
-        info "MkeChildConfig ${ns}/${child_name} not found — nothing to delete."
+        info "CRD ${CHILD_CRD} not installed — no child cluster to delete."
     fi
     rm -f "$(child_marker_file)" "$(child_kubeconfig_file)" "$(child_credentials_file)"
     success "Child cluster removed."
@@ -6103,12 +6120,26 @@ child_destroy_before_teardown() {
     _child_lab_supported "${output}" || return 0
 
     if [[ -f "${KUBECONFIG}" ]] && kubectl get nodes --request-timeout=20s >/dev/null 2>&1; then
-        if ! kubectl get crd "${CHILD_CRD}" >/dev/null 2>&1; then
+        local rc=0 cand left
+        _child_crd_state || rc=$?
+        # An API error can't prove there is no child (the local record may be
+        # missing, or a child created outside t) — fail closed either way.
+        (( rc == 2 )) && die "Could not query CRD ${CHILD_CRD} (API error), so child clusters can't be ruled out. Re-run, or set T_SKIP_CHILD=1 to skip (any child's AWS resources would be orphaned)."
+
+        if (( rc == 1 )); then
             rm -f "${marker}"
             return 0
         fi
         names="$(kubectl -n "${ns}" get mkechildconfig -o jsonpath='{.items[*].metadata.name}')" \
             || die "Could not list MkeChildConfigs in ${ns}. Re-run, or set T_SKIP_CHILD=1 to skip (child AWS resources would be orphaned)."
+        # An interrupted delete leaves no MkeChildConfig but still a ClusterDeployment /
+        # CAPI Cluster: wait for the recorded (or this lab's) child's objects too.
+        for cand in "$(cat "${marker}" 2>/dev/null || true)" "${child_name}"; do
+            [[ -n "${cand}" && " ${names} " != *" ${cand} "* ]] || continue
+            left="$(_child_remaining "${cand}")"
+            [[ "${left}" == "?" ]] && die "Could not list ${cand}'s k0rdent/CAPI objects (API error). Re-run, or set T_SKIP_CHILD=1 to skip."
+            [[ -n "${left}" ]] && names="${names:+${names} }${cand}"
+        done
         if [[ -n "${names}" ]]; then
             info "Child cluster(s) found: ${names} — deleting them first so CAPA can remove their AWS resources."
             for n in ${names}; do
