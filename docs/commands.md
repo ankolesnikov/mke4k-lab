@@ -10,7 +10,7 @@
 | `t deploy instances` | Terraform only (provision infrastructure) |
 | `t deploy cluster` | mkectl only (install MKE4k on existing instances) |
 | `t destroy cluster` | Uninstall MKE4k (mkectl reset --force) |
-| `t destroy lab` | Teardown all AWS infrastructure (terraform destroy); deletes any child cluster first |
+| `t destroy lab` | Teardown all AWS infrastructure (terraform destroy); deletes any child cluster first. Afterwards removes this lab's local leftovers: generated logins and PKI in `terraform/`, generated configs, the MKE4k kubeconfig (if it points at this lab) and the MKE3 client bundle |
 
 ## MKE3
 
