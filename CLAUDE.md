@@ -133,7 +133,7 @@ Edit `config` before deploying. Key variables:
 | `ccm_enabled` | `false` (fallback `true` if the line is absent) | Creates IAM role; required for LoadBalancer services. MKE4k: enables `cloudProvider` in mke4.yaml; MKE3: adds `--cloud-provider=aws` install flag. Auto-disabled in airgap (no AWS API access) |
 | `nfs_enabled` | `true` (fallback `false` if the line is absent) | NFS server + `nfs-client` default StorageClass (required by KOF and MSR4-HA). Works in all modes incl. MKE3: MKE3 kubeconfig comes from the launchpad client bundle (`source env.sh`) |
 | `debug` | `true` | `true` adds `-l debug` to mkectl (works for all modes including airgap) |
-| `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless |
+| `kof_enabled` | `false` | Auto-deploy KOF at the end of lab deploys; `t deploy kof [airgap]` works standalone regardless. Needs ~3 workers with ≥ 4 vCPU/16 GB (`kof_warn_capacity` warns below that; default 1 × m5a.large leaves pods Pending) |
 | `kof_version` | `1.8.1` | KOF umbrella chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. These are the **only tested and validated** versions; any other is untested. See *KOF values layering* |
 | `kof_mode` | `lean` | KOF scope: `full` (observability + FinOps) or `lean` (cluster monitoring only). Grafana + HTTPS gateway and MKE-monitoring reuse are on by default (advanced settings) |
 | `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI (rotated password + Envoy gateway, NodePort `k0rdent_ui_nodeport`=33003, NLB `k0rdent_ui_lb_port`=8445) at the end of `t deploy lab`/`lab airgap`; required by `t deploy k0rdent-ui` |

@@ -14,6 +14,8 @@ KOF (k0rdent Observability & FinOps) is deployed in **self-monitoring (M2M) mode
 
 Set `kof_enabled=true` in `config` to auto-deploy KOF at the end of `t deploy lab` / `t deploy lab airgap`, or run `t deploy kof` (online) / `t deploy kof airgap` against an already-running cluster. It **requires a StorageClass** — set `nfs_enabled=true` (or run `t deploy nfs`) first; the deploy resolves the cluster default StorageClass, falling back to `nfs-client`, and dies with an actionable message if neither exists.
 
+**Sizing:** KOF does not fit the default lab (1 × `m5a.large` worker). Plan for about **3 workers with ≥ 4 vCPU / 16 GB**, e.g. `worker_count=3` + `worker_flavor="m5a.xlarge"` (validated with KOF 1.4.1 lean, no Pending pods). On 1 × `m5a.large` ten KOF pods stayed Pending and the VMCluster failed; 3 × `m5a.large` still left collector pods Pending on full nodes. `t deploy kof` warns when the config is below this.
+
 KOF installs as a **FluxCD-sequenced OCI umbrella Helm chart** (`oci://registry.mirantis.com/k0rdent-enterprise/charts/kof`) via **helm v3** (helm v4 has a webhook bug). The committed, version-pinned asset `kof/global-values.yaml` repoints every subchart image to `kof_registry`. The deploy is idempotent (`helm upgrade -i`).
 
 **Airgap:** the MKE 4.2.0 offline bundle ships all KOF charts and images, so after `t deploy lab airgap` the bastion's Harbor already holds everything KOF needs. `t deploy kof airgap` runs the whole install from the bastion (helm/kubectl/mkectl there), auto-derives `kof_registry` to `<registry-hostname>/mke`, auto-enables the Grafana gateway (the only path to Grafana in airgap), and prints `t tunnel grafana` access at the end.

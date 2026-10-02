@@ -55,6 +55,7 @@ msr4_replicas=1
 
 # -- KOF observability (t deploy kof) --
 # Requires MKE 4.2.0+. true -> deploys automatically at the end of 't deploy lab'.
+# Needs ~3 workers with >= 4 vCPU/16 GB (worker_count=3, worker_flavor="m5a.xlarge").
 kof_enabled=false
 # Must match the cluster's k0rdent release. Validated: 1.8.1 (MKE 4.2.0), 1.4.1 (MKE 4.2.1).
 kof_version="1.8.1"

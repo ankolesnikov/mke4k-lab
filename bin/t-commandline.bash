@@ -4749,6 +4749,27 @@ kof_helm_install() {
     return 0
 }
 
+# KOF needs real capacity: live tests left pods Pending (VMCluster failed) on
+# 1x m5a.large and still 4 collector pods Pending on 3x m5a.large; 3x m5a.xlarge
+# ran clean. Warn (don't block) when config is below that. vCPU/memory come from
+# EC2 DescribeInstanceTypes (c5.xlarge is 4 vCPU but only 8 GiB); without AWS
+# access, fall back to the size suffix (*.large and smaller = too small).
+kof_warn_capacity() {
+    local small=false spec vcpu mib
+    spec="$(aws ec2 describe-instance-types --region "${region}" --instance-types "${worker_flavor}" \
+        --query 'InstanceTypes[0].[VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]' --output text 2>/dev/null || true)"
+    read -r vcpu mib <<<"${spec}" || true
+    if [[ "${vcpu}" =~ ^[0-9]+$ && "${mib}" =~ ^[0-9]+$ ]]; then
+        (( vcpu < 4 || mib < 15360 )) && small=true
+    elif [[ "${worker_flavor}" =~ \.(nano|micro|small|medium|large)$ ]]; then
+        small=true
+    fi
+    if (( worker_count < 3 )) || [[ "${small}" == "true" ]]; then
+        warn "KOF needs about 3 workers with >= 4 vCPU / 16 GB (e.g. worker_count=3, worker_flavor=m5a.xlarge)."
+        warn "  This lab has worker_count=${worker_count}, worker_flavor=${worker_flavor}: some KOF pods may stay Pending."
+    fi
+}
+
 cmd_deploy_kof() {
     local mode_arg="${1:-}" airgap_arg="${2:-}"
     load_config
@@ -4761,6 +4782,7 @@ cmd_deploy_kof() {
         full|lean) kof_mode="${mode}" ;;
         *) die "Unknown KOF mode '${mode}'. Try: full, lean." ;;
     esac
+    kof_warn_capacity
 
     # Resolve online vs airgap: the airgap topology is a property of the deployed
     # lab (bastion present), so auto-detect from terraform output — the explicit
