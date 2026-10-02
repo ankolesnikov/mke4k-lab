@@ -2146,9 +2146,13 @@ ensure_mke3_client_bundle() {
     info "Generating MKE3 client bundle..." >&2
     launchpad client-config -a -c "${launchpad_yaml}" >&2
 
-    local bundle_dir
-    bundle_dir="$(ls -d "${HOME}"/.mirantis-launchpad/cluster/*/bundle/admin 2>/dev/null | head -1 || true)"
-    [[ -n "${bundle_dir}" ]] || die "Client bundle not found."
+    # launchpad keeps one bundle per cluster under cluster/<metadata.name>/, and
+    # ~/.mirantis-launchpad persists across labs (run.sh bind mount) — pick this lab's.
+    local lp_name bundle_dir
+    lp_name="$(yq e '.metadata.name // ""' "${launchpad_yaml}" 2>/dev/null || true)"
+    [[ -n "${lp_name}" ]] || die "Could not read metadata.name from ${launchpad_yaml}."
+    bundle_dir="${HOME}/.mirantis-launchpad/cluster/${lp_name}/bundle/admin"
+    [[ -f "${bundle_dir}/env.sh" ]] || die "Client bundle for '${lp_name}' not found at ${bundle_dir}."
     echo "${bundle_dir}"
 }
 
@@ -6410,14 +6414,27 @@ cmd_deploy_msr4_airgap() {
 # here), and MKE3 has no such kubeconfig. So:
 #   airgap -> kubectl on the bastion (MKE4k kubeconfig, else MKE3 client bundle)
 #   online -> local MKE4k kubeconfig, else MKE3 client bundle
-# The MKE4k kubeconfig wins when both exist (MKE3 lab already upgraded to MKE4k).
+# The MKE4k kubeconfig wins when both exist (MKE3 lab already upgraded to MKE4k) —
+# but only if it targets *this* lab's NLB: ~/.mke/mke.kubeconf survives
+# 't destroy lab', so a stale one from an earlier lab must not shadow MKE3.
 cmd_status() {
-    load_config
+    # Read terraform output before load_config: with the default cluster_name and
+    # no lab yet, load_config would persist a random .cluster-id and pin the name
+    # of the next deploy (skipping its owner-name prompt). Status must not do that.
     local output
     output="$(tf_output 2>/dev/null || true)"
+    if [[ -z "${output}" || "${output}" == "{}" ]]; then
+        [[ -f "${KUBECONFIG}" ]] \
+            || die "No lab found (no terraform state). Deploy a lab first with 't deploy lab'."
+        warn "No terraform state in this workspace — querying ${KUBECONFIG} as-is (it may belong to a destroyed lab)."
+        kubectl --kubeconfig="${KUBECONFIG}" --request-timeout=15s get nodes -o wide
+        return 0
+    fi
+    load_config
 
-    local bastion_ip mke3_lb_dns ssh_key
+    local bastion_ip mke3_lb_dns ssh_key lb_dns
     bastion_ip="$(echo "${output}" | jq -r '.bastion_public_ip.value // empty' 2>/dev/null || true)"
+    lb_dns="$(echo "${output}" | jq -r '.lb_dns_name.value // empty' 2>/dev/null || true)"
     mke3_lb_dns="$(echo "${output}" | jq -r '.mke3_lb_dns_name.value // empty' 2>/dev/null || true)"
     ssh_key="$(echo "${output}" | jq -r '.ssh_key_path.value // empty' 2>/dev/null || true)"
 
@@ -6444,7 +6461,16 @@ cmd_status() {
         return 0
     fi
 
+    # Local MKE4k kubeconfig counts only when it points at this lab's NLB
+    # (no terraform output -> can't tell, keep the old behaviour).
+    local kc_current=false
     if [[ -f "${KUBECONFIG}" ]]; then
+        if [[ -z "${lb_dns}" || "${lb_dns}" == "null" ]] || grep -qF "${lb_dns}" "${KUBECONFIG}"; then
+            kc_current=true
+        fi
+    fi
+
+    if [[ "${kc_current}" == "true" ]]; then
         info "Cluster node status:"
         kubectl --kubeconfig="${KUBECONFIG}" get nodes -o wide
     elif [[ -n "${mke3_lb_dns}" && "${mke3_lb_dns}" != "null" ]]; then
@@ -6459,6 +6485,8 @@ cmd_status() {
             set -u
             kubectl get nodes -o wide
         )
+    elif [[ -f "${KUBECONFIG}" ]]; then
+        die "${KUBECONFIG} does not target this lab's NLB (${lb_dns}) — it is left over from an earlier lab. Run 't deploy cluster' (or remove the file)."
     else
         die "Kubeconfig not found at ${KUBECONFIG}. Has the cluster been deployed?"
     fi
