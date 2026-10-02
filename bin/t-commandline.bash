@@ -3896,18 +3896,20 @@ cmd_destroy_lab() {
     # Clear any 't expiry' override so a future lab starts from config defaults.
     rm -f "${PROJECT_ROOT}/.expiry-days" "${PROJECT_ROOT}/.expiry-base"
     rm -f "$(child_marker_file)" "$(child_kubeconfig_file)" "$(child_credentials_file)"
-    remove_lab_local_files "${lb_dns}" "${lp_name}"
+    remove_lab_local_files "${lb_dns}" "${lp_name}" "${cluster_name}"
     success "Lab destroyed."
 }
 
 # Delete the local files that belong to a lab that no longer exists: generated
 # logins, PKI and configs in terraform/ (otherwise the next lab silently reuses
 # e.g. registry_credentials.txt), this lab's MKE4k kubeconfig (only if it points
-# at this lab's NLB) and its launchpad client bundle. Call only after a
+# at this lab's NLB) and its launchpad client bundle (only when launchpad.yaml
+# names this lab — generate_launchpad_yaml sets metadata.name = cluster_name, so a
+# launchpad.yaml left over from an earlier lab never deletes that lab's bundle). Call only after a
 # successful terraform destroy. tfstate and tfvars (regenerated) are left
 # alone; aws_private.pem is a Terraform local_file, so the destroy removes it.
 remove_lab_local_files() {
-    local lb_dns="${1:-}" lp_name="${2:-}" f
+    local lb_dns="${1:-}" lp_name="${2:-}" lab_name="${3:-}" f
     for f in mke4.yaml mke4.yaml.bak launchpad.yaml nodes.yaml \
              mke3-config.toml mke3-config.toml.bak \
              mke3_credentials.txt registry_credentials.txt registry_ca.crt \
@@ -3920,7 +3922,7 @@ remove_lab_local_files() {
         && grep -qF "${lb_dns}" "${HOME}/.mke/mke.kubeconf"; then
         rm -f "${HOME}/.mke/mke.kubeconf"
     fi
-    if [[ -n "${lp_name}" && "${lp_name}" != */* && "${lp_name}" != .* ]]; then
+    if [[ -n "${lp_name}" && "${lp_name}" == "${lab_name}" && "${lp_name}" != */* && "${lp_name}" != .* ]]; then
         rm -rf "${HOME}/.mirantis-launchpad/cluster/${lp_name:?}"
     fi
     info "Removed this lab's local credentials, generated configs, kubeconfig and client bundle."

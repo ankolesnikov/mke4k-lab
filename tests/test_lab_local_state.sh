@@ -61,9 +61,12 @@ done
 [[ ! -e "${HOME}/.mirantis-launchpad/cluster/mke4k-lab-abcd" ]] || fail "this lab's client bundle survived"
 [[ -d "${HOME}/.mirantis-launchpad/cluster/other-lab" ]] || fail "another lab's client bundle was removed"
 
-# 3. A kubeconfig for a different lab is left alone.
+# 3. A kubeconfig, or a launchpad.yaml naming a different lab, is left alone.
+printf 'metadata:\n  name: mke4k-lab-old1\n' > "${test_dir}/terraform/launchpad.yaml"
+mkdir -p "${HOME}/.mirantis-launchpad/cluster/mke4k-lab-old1/bundle/admin"
 printf 'server: https://some-other-lab-nlb:6443\n' > "${HOME}/.mke/mke.kubeconf"
 "${test_dir}/bin/t-commandline.bash" destroy lab >/dev/null 2>&1 || fail "second 't destroy lab' failed"
 [[ -e "${HOME}/.mke/mke.kubeconf" ]] || fail "another lab's kubeconfig was removed"
+[[ -d "${HOME}/.mirantis-launchpad/cluster/mke4k-lab-old1" ]] || fail "a stale launchpad.yaml deleted another lab's bundle"
 
 echo "lab local state tests passed"
