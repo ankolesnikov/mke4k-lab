@@ -26,6 +26,8 @@ host checkout (bind-mounted at `/mke4k-lab`); with a bare `docker run` it is the
 3. **Never delete or overwrite** `terraform/terraform.tfstate*`, `terraform/aws_private.pem`,
    `.cluster-id`, `.owner`, `.expiry-*`, or the `run.sh` mounts `.aws/`, `.mke/`, `.mirantis-launchpad/`. Losing them orphans AWS resources (recovery path:
    `bin/cleanup-aws.sh <cluster-name> [region]`, which is itself destructive — rule 1 applies).
+   `t destroy lab` itself removes the lab's generated logins, configs, kubeconfig and client bundle
+   after a successful destroy; that is expected.
 4. **Never print, commit or send secrets**: AWS keys, the AWS SSO cache under `.aws/`, `aws_private.pem`, `terraform/*_credentials.txt`,
    `msr4_*.key`, the MKE3 bearer token, Grafana passwords. They are git- and docker-ignored; keep it so.
    When the user needs a password, point them at the file path instead of echoing it. Note that
@@ -125,6 +127,7 @@ terraform -chdir=terraform init -backend=false && terraform -chdir=terraform val
 python3 -m py_compile terraform/reaper.py
 bash tests/test_container_launcher.sh                        # run.sh + host guard (mock docker)
 bash tests/test_expiry_status.sh                             # needs GNU date: run in the container
+bash tests/test_lab_local_state.sh                           # needs jq: run in the container
 docker build -t mke4k-lab .                                  # if Docker is available
 ```
 

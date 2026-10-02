@@ -115,10 +115,15 @@ load_config() {
     # ask for the user's name so both the user and the cloud admin can identify
     # the resources (mke4k-lab-<name> prefix + Owner tag). Non-interactive runs
     # and all other commands fall back to a random 4-char suffix.
-    # The suffix is persisted in .cluster-id so it stays consistent across commands.
+    # The suffix is persisted in .cluster-id so it stays consistent across commands,
+    # but only by resource-creating commands: any other command run without a lab
+    # (t status child, t show summary, ...) must not pin the next deploy's name
+    # and skip its owner-name prompt, so it gets a throwaway in-memory suffix.
     if [[ "${cluster_name}" == "mke4k-lab" ]]; then
         local id_file="${PROJECT_ROOT}/.cluster-id"
-        if [[ ! -f "${id_file}" ]]; then
+        if [[ ! -f "${id_file}" && "${_T_ASK_NAME:-false}" != "true" ]]; then
+            cluster_name="mke4k-lab-$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)"
+        elif [[ ! -f "${id_file}" ]]; then
             local suffix=""
             if [[ "${_T_ASK_NAME:-false}" == "true" && -t 0 ]]; then
                 echo ""
@@ -139,7 +144,7 @@ load_config() {
             echo "${suffix}" > "${id_file}"
             info "Cluster name: mke4k-lab-${suffix} (saved to .cluster-id)"
         fi
-        cluster_name="mke4k-lab-$(cat "${id_file}")"
+        [[ -f "${id_file}" ]] && cluster_name="mke4k-lab-$(cat "${id_file}")"
     fi
 
     # Owner name (set by the deploy-time prompt) → Owner tag on all AWS resources
@@ -2166,11 +2171,9 @@ deploy_nfs_provisioner_airgap() {
 # its directory on stdout. Status output goes to stderr so callers can
 # capture the path with $(...).
 ensure_mke3_client_bundle() {
+    local force="${1:-}"   # "force": always regenerate (explicit 't gen client-bundle')
     local launchpad_yaml="${TERRAFORM_DIR}/launchpad.yaml"
     [[ -f "${launchpad_yaml}" ]] || die "launchpad.yaml not found. Deploy MKE3 first."
-    ensure_launchpad >&2
-    info "Generating MKE3 client bundle..." >&2
-    launchpad client-config -a -c "${launchpad_yaml}" >&2
 
     # launchpad keeps one bundle per cluster under cluster/<metadata.name>/, and
     # ~/.mirantis-launchpad persists across labs (run.sh bind mount) — pick this lab's.
@@ -2178,6 +2181,21 @@ ensure_mke3_client_bundle() {
     lp_name="$(yq e '.metadata.name // ""' "${launchpad_yaml}" 2>/dev/null || true)"
     [[ -n "${lp_name}" ]] || die "Could not read metadata.name from ${launchpad_yaml}."
     bundle_dir="${HOME}/.mirantis-launchpad/cluster/${lp_name}/bundle/admin"
+
+    # Reuse a bundle made after the current launchpad.yaml (rewritten by every
+    # deploy), so a same-named bundle left by an earlier lab is never picked up.
+    local f complete=true
+    for f in env.sh kube.yml ca.pem cert.pem key.pem; do
+        [[ -s "${bundle_dir}/${f}" ]] || complete=false
+    done
+    if [[ "${force}" != "force" && "${complete}" == "true" \
+          && "${bundle_dir}/env.sh" -nt "${launchpad_yaml}" ]]; then
+        echo "${bundle_dir}"
+        return 0
+    fi
+    ensure_launchpad >&2
+    info "Generating MKE3 client bundle..." >&2
+    launchpad client-config -a -c "${launchpad_yaml}" >&2
     [[ -f "${bundle_dir}/env.sh" ]] || die "Client bundle for '${lp_name}' not found at ${bundle_dir}."
     echo "${bundle_dir}"
 }
@@ -3865,6 +3883,10 @@ cmd_destroy_cluster_mke3_airgap() {
 
 cmd_destroy_lab() {
     load_config
+    # Read what identifies this lab's local leftovers before the state is gone.
+    local lb_dns lp_name
+    lb_dns="$(tf_output 2>/dev/null | jq -r '.lb_dns_name.value // empty' 2>/dev/null || true)"
+    lp_name="$(yq e '.metadata.name // ""' "${TERRAFORM_DIR}/launchpad.yaml" 2>/dev/null || true)"
     # CAPA-owned child clusters must go while the management cluster still runs.
     child_destroy_before_teardown
     write_tfvars
@@ -3872,7 +3894,34 @@ cmd_destroy_lab() {
     # Clear any 't expiry' override so a future lab starts from config defaults.
     rm -f "${PROJECT_ROOT}/.expiry-days" "${PROJECT_ROOT}/.expiry-base"
     rm -f "$(child_marker_file)" "$(child_kubeconfig_file)" "$(child_credentials_file)"
+    remove_lab_local_files "${lb_dns}" "${lp_name}"
     success "Lab destroyed."
+}
+
+# Delete the local files that belong to a lab that no longer exists: generated
+# logins, PKI and configs in terraform/ (otherwise the next lab silently reuses
+# e.g. registry_credentials.txt), this lab's MKE4k kubeconfig (only if it points
+# at this lab's NLB) and its launchpad client bundle. Call only after a
+# successful terraform destroy. tfstate and tfvars (regenerated) are left
+# alone; aws_private.pem is a Terraform local_file, so the destroy removes it.
+remove_lab_local_files() {
+    local lb_dns="${1:-}" lp_name="${2:-}" f
+    for f in mke4.yaml mke4.yaml.bak launchpad.yaml nodes.yaml \
+             mke3-config.toml mke3-config.toml.bak \
+             mke3_credentials.txt registry_credentials.txt registry_ca.crt \
+             msr4_credentials.txt msr4_redis_password.txt msr4_ca.crt msr4_ca.key \
+             msr4_ca.srl msr4_tls.crt msr4_tls.key msr4_tls.csr \
+             k0rdent_ui_credentials.txt; do
+        rm -f "${TERRAFORM_DIR:?}/${f}"
+    done
+    if [[ -n "${lb_dns}" && -f "${HOME}/.mke/mke.kubeconf" ]] \
+        && grep -qF "${lb_dns}" "${HOME}/.mke/mke.kubeconf"; then
+        rm -f "${HOME}/.mke/mke.kubeconf"
+    fi
+    if [[ -n "${lp_name}" && "${lp_name}" != */* && "${lp_name}" != .* ]]; then
+        rm -rf "${HOME}/.mirantis-launchpad/cluster/${lp_name:?}"
+    fi
+    info "Removed this lab's local credentials, generated configs, kubeconfig and client bundle."
 }
 
 # Format a seconds delta as "Xd Yh" (or "Xh Ym" under a day).
@@ -6235,9 +6284,9 @@ cmd_rotate_child_creds() {
 }
 
 cmd_status_child() {
-    load_config
     local kc; kc="$(child_kubeconfig_file)"
     [[ -f "${kc}" ]] || die "Child kubeconfig not found at ${kc}. Run 't deploy child-cluster' first."
+    load_config
     kubectl -n "${kof_kcm_namespace}" get mkechildconfig "${child_name}" 2>/dev/null || true
     info "Child cluster node status:"
     kubectl --kubeconfig="${kc}" get nodes -o wide
@@ -7305,8 +7354,8 @@ cmd_deploy_msr4_airgap() {
 #   airgap -> kubectl on the bastion (MKE4k kubeconfig, else MKE3 client bundle)
 #   online -> local MKE4k kubeconfig, else MKE3 client bundle
 # The MKE4k kubeconfig wins when both exist (MKE3 lab already upgraded to MKE4k) —
-# but only if it targets *this* lab's NLB: ~/.mke/mke.kubeconf survives
-# 't destroy lab', so a stale one from an earlier lab must not shadow MKE3.
+# but only if it targets *this* lab's NLB: one from an earlier lab can still be
+# there (destroyed before 't destroy lab' cleaned it up, or another checkout's).
 cmd_status() {
     # Read terraform output before load_config: with the default cluster_name and
     # no lab yet, load_config would persist a random .cluster-id and pin the name
@@ -7371,7 +7420,7 @@ cmd_status() {
             cd "${bundle_dir}"
             set +u   # env.sh may reference unset vars
             # shellcheck source=/dev/null
-            source env.sh
+            source env.sh >/dev/null
             set -u
             kubectl get nodes -o wide
         )
@@ -7661,7 +7710,7 @@ cmd_gen_client_bundle() {
     else
         # Online: run locally
         local bundle_dir
-        bundle_dir="$(ensure_mke3_client_bundle)"
+        bundle_dir="$(ensure_mke3_client_bundle force)"
 
         success "Client bundle downloaded to: ${bundle_dir}"
         echo ""
