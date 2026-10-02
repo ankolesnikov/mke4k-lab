@@ -408,7 +408,7 @@ ensure_mkectl() {
     # Already at the right version?
     if command -v mkectl &>/dev/null; then
         local got
-        got="$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+        got="$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1 || true)"
         if [[ "${got}" == "${want}" ]]; then
             return 0
         fi
@@ -1665,7 +1665,7 @@ ensure_mkectl_on_bastion() {
     ssh_node "${ssh_key}" "${bastion_ip}" "
         need_install=true
         if command -v mkectl &>/dev/null; then
-            got=\$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            got=\$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1 || true)
             if [[ \"\${got}\" == '${want}' ]]; then
                 echo 'mkectl ${want} already installed'
                 need_install=false
