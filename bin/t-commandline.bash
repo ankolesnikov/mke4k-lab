@@ -36,6 +36,11 @@ die()     { error "$*"; exit 1; }
 # version_gte <a> <b> — returns 0 (true) if version a >= b
 version_gte() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
 
+# has_tty — true when stdin is a terminal and /dev/tty can be opened. Guard every
+# interactive prompt with it so CI / agents / `docker run` without -t fall back to
+# the non-interactive default instead of dying under `set -e`.
+has_tty() { [[ -t 0 ]] && { : < /dev/tty; } 2>/dev/null; }
+
 # Sanitize a user-typed name for use in AWS resource names: lowercase
 # a-z/0-9/hyphen only, max 10 chars. AWS caps NLB/target-group names at 32
 # chars and the longest generated name is <cluster_name>-mke3-nlb-sg (+12),
@@ -2718,12 +2723,16 @@ generate_nodes_yaml() {
 # ---------------------------------------------------------------------------
 prompt_mkectl_for_upgrade() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             # Temporarily set mke4k_version so ensure_mkectl uses the chosen value
             local saved="${mke4k_version}"
@@ -2743,12 +2752,16 @@ prompt_mkectl_for_upgrade() {
 # ---------------------------------------------------------------------------
 prompt_upgrade_prep_airgap() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
@@ -2825,12 +2838,16 @@ prompt_upgrade_prep_airgap() {
 # ---------------------------------------------------------------------------
 prompt_mke4k_upgrade_prep_airgap() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
