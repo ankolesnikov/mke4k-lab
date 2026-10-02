@@ -5,6 +5,9 @@
 .mke/
 .mirantis-launchpad/
 .aws/
+.child-cluster
+terraform/child.kubeconfig
+terraform/child_credentials.txt
 .claude
 .DS_Store
 mke3/

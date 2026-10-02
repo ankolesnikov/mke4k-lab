@@ -5,6 +5,9 @@
 .mke/
 .mirantis-launchpad/
 .aws/
+.child-cluster
+terraform/child.kubeconfig
+terraform/child_credentials.txt
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/
@@ -39,6 +42,7 @@ Dockerfile
 CLAUDE.md
 AGENTS.md
 README.md
+docs/
 kof/MKE4-INTEGRATION.md
 kof/INSTALL-MKE.md
 kof/KOF-RUNBOOK.md

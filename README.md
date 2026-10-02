@@ -1,150 +1,102 @@
 # mke4k-lab
 
-A standalone AWS lab provisioning tool for [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/) and MKE3.
+**Your tool for provisioning [Mirantis Kubernetes Engine 4k](https://www.mirantis.com/software/mke-4/) and MKE3 lab clusters on AWS — fast to stand up, fast to throw away.**
 
-Terraform provisions a dedicated VPC, EC2 instances, NLB, and IAM role; `mkectl apply` / `launchpad apply` installs the product. Supports four deployment modes: **MKE4k** (default), **MKE3** (for upgrade testing), **MKE4k Airgap** (true network isolation with a private registry), and **MKE3 Airgap** (MKE3 in network isolation with proxy-based MCR installation).
+Need a cluster to reproduce an issue, test an upgrade, try a feature or run a demo? Edit one config file, run `t deploy lab`, and you get a fully installed cluster with a summary of its URLs and node IPs. Done with it? `t destroy lab` removes every AWS resource it created.
 
-## Quick Start
+- **One command each way.** Terraform provisions a dedicated VPC, EC2 instances, load balancer and IAM; `mkectl` / `launchpad` installs the product on top. No manual AWS setup.
+- **Nothing to install.** Everything runs in a Docker container that already has Terraform, kubectl, helm, the AWS CLI and k9s; `mkectl` is fetched at the version you pick.
+- **Isolated and self-cleaning.** Each lab gets its own VPC, tagged with your name, and deletes itself after a few days (`expiry_days`) if you forget it.
+- **Four deployment modes:** **MKE4k** (default), **MKE4k airgap** (no internet on the nodes, with a private MSR4 registry), **MKE3** (for upgrade testing) and **MKE3 airgap**.
+- **Add-ons on demand:** NFS storage, MSR4, KOF observability, the k0rdent UI, and MKE4k **child clusters** provisioned through k0rdent.
 
-### Option A — Prebuilt Docker image (easiest)
+## Quick start
 
-The latest image is always published to `registry.ci.mirantis.com/ajagiello/mke4k-lab:latest`, so you can skip the build entirely:
+### 1. Run the container
 
 ```bash
-# Pull the prebuilt image
-docker pull registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
-
-# First run — name the container so you can re-attach later
 docker run -it --name mke4k-lab registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+```
 
-# For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8443 = KOF Grafana, 8444 = MSR4 (Harbor) UI, 8445 = k0rdent UI
+**Need airgap?** Run it with the ports for the UI tunnels instead:
+
+```bash
 docker run -it --name mke4k-lab \
   -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
   registry.ci.mirantis.com/ajagiello/mke4k-lab:latest
+# 3000 = MKE dashboard, 8443 = KOF Grafana / registry, 8444 = MSR4 UI, 8445 = k0rdent UI
 ```
 
-For a persistent workspace and AWS SSO instead of static access keys, use `run.sh` below. The bare `docker run` examples do not mount the checkout or an AWS SSO cache.
+The latest image is always published to `registry.ci.mirantis.com/ajagiello/mke4k-lab:latest` and includes every change in this repo. To build it yourself, see [docs/development.md](docs/development.md).
 
-> The bastion's Harbor registry UI is reachable directly at `https://<bastion-public-ip>` (the bastion has a public IP and the SG opens 443), so no port mapping or tunnel is needed for it.
+To pass AWS credentials from your host, add `-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN`. Lab state lives inside the container, so keep it: re-attach later with `docker start -ai mke4k-lab`.
 
-To keep Terraform state, generated SSH keys, manifests, credentials, and client configuration on the host, run this script from a checkout of this repository (it also works when called from another directory):
+**Persistent workspace and AWS SSO (`run.sh`).** To keep Terraform state, keys and kubeconfigs on your host and log in with AWS IAM Identity Center instead of static keys, start the container from a checkout of this repo:
 
 ```bash
-./run.sh
+./run.sh --sso-configure                    # once: pick SSO session, account, role, profile name
+./run.sh --aws-profile my-lab --sso-login   # device-code login in your host browser
+./run.sh --aws-profile my-lab               # every session; then: aws sts get-caller-identity
 ```
 
-`run.sh` creates private host directories for `.mke`, `.mirantis-launchpad`, and `.aws`, mounts them and the checkout into the container, and publishes ports 3000, 8443, 8444, and 8445 for UI tunnels. The project mount preserves Terraform state, generated SSH keys, and manifests; `.mke` preserves the MKE4k kubeconfig, `.mirantis-launchpad` preserves the online MKE3 client bundle, and `.aws` preserves the lab's AWS SSO configuration and login cache. The `.aws` directory is excluded from Git and Docker builds; its cached tokens are sensitive. The `.bashrc` mount enables the local `t expiry status` banner even with an older prebuilt image. The host checkout supplies `bin/t-commandline.bash`, so update the checkout along with the image. A fresh checkout needs `terraform init`, which `t deploy lab` runs before applying. The container is removed after exit, while the bind-mounted files remain on the host.
+`run.sh` mounts the checkout plus private `.mke`, `.mirantis-launchpad` and `.aws` directories, publishes the tunnel ports, and never forwards host static keys. Steps 2–6 below are the same inside it (skip step 2). `t` refuses to run on the host. Details: [docs/development.md](docs/development.md#persistent-workspace-and-aws-sso-runsh).
 
-To use AWS IAM Identity Center, configure a named profile once, then log in using the device code in your host browser:
+### 2. Set your AWS credentials
+
+Skip this if you passed them with `docker run -e`.
 
 ```bash
-./run.sh --sso-configure                         # choose an SSO session, account, role, and profile name
-./run.sh --aws-profile my-lab --sso-login        # open the displayed URL on the host and enter its code
-./run.sh --aws-profile my-lab                    # later sessions use the saved profile and cache
-# Inside the container, before deployment:
-aws sts get-caller-identity
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."      # temporary credentials only
 ```
 
-Use the profile name chosen during configuration in place of `my-lab`. Login is explicit, not repeated automatically on every launch. `run.sh` never forwards static AWS access-key variables from the host. `t` commands refuse to run on the host; use the container. The launcher also works through a symlink placed in your `PATH`. To pass Bash arguments, use `./run.sh --aws-profile my-lab -- -lc 'your command'`. AWS documents the [SSO configuration and device-code login flow](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html).
+### 3. Edit the config
 
-### Option B — Build the Docker image yourself
+Version, node counts, add-ons. The defaults work as-is.
 
 ```bash
-# Build the image (terraform providers pre-initialised during build)
-docker build -t mke4k-lab .
-
-# First run — name the container so you can re-attach later
-docker run -it --name mke4k-lab mke4k-lab
-
-# For airgap deployments, add port mappings for UI tunnels
-#   3000 = MKE4k/MKE3 Dashboard, 8443 = KOF Grafana, 8444 = MSR4 (Harbor) UI, 8445 = k0rdent UI
-docker run -it --name mke4k-lab \
-  -p 3000:3000 -p 8443:8443 -p 8444:8444 -p 8445:8445 \
-  mke4k-lab
+vi /mke4k-lab/config
 ```
 
-The manual `docker run` examples do not have the persistent `.aws` mount. Use `run.sh` for the SSO workflow above.
-
-Once inside the container:
-```bash
-vi /mke4k-lab/config      # edit cluster settings
-t deploy lab              # MKE4k: provision EC2 + NLB, then install
-t deploy lab mke3         # MKE3:  provision + launchpad apply
-t deploy lab airgap       # Airgap: bastion + registry + MKE4k (no internet on nodes)
-t deploy lab mke3-airgap  # MKE3 Airgap: bastion + registry + proxy + MKE3
-t show nodes              # print IPs
-t destroy lab             # teardown
-```
-
-**Re-attaching after exit without bind mounts** — `terraform.tfstate`, `mke4.yaml`, and `aws_private.pem` live inside the named container, so keep it around:
-```bash
-docker start -ai mke4k-lab
-```
-
-To copy the SSH key or state out to your host:
-```bash
-docker cp mke4k-lab:/mke4k-lab/terraform/aws_private.pem .
-docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
-```
-
-### Configure and deploy from the container
-
-`t` runs only inside the container (it refuses to start without `MKE4K_LAB_CONTAINER=1`, which the Dockerfile and `run.sh` set); the host needs just `docker` (plus the `aws` CLI v2 if you use `bin/cleanup-aws.sh`). The image ships `terraform`, `kubectl`, `helm` v3 (helm v4 is not supported by KOF), `jq`, `yq` (mikefarah v4), `openssl` and `ssh`/`scp`; `mkectl` and `launchpad` are downloaded automatically at the versions set in `config`.
-
-Edit `config` in the host checkout or inside the container:
-
-```bash
-vi config
-```
-
-```bash
-cluster_name="mke4k-lab"       # first deploy asks for your name -> mke4k-lab-<name> (random ID if non-interactive)
-controller_count=1
-worker_count=1
-controller_flavor="m5a.xlarge"
-worker_flavor="m5a.large"
-region="eu-central-1"
-expiry_days=3                  # lab auto-deletes after 3 days (0 = never) — see "Auto-expiry"
-mke4k_version="v4.2.0"
-os_name="ubuntu"               # cluster node OS: ubuntu or redhat
-os_version="22.04"             # ubuntu: 22.04/24.04 | redhat: 9.6/8.10
-```
-
-Then start the container with `./run.sh --aws-profile my-lab` and deploy inside it:
+### 4. Deploy
 
 ```bash
 t deploy lab
 ```
 
-This will:
-1. Run `terraform init` + `terraform apply` (provisions dedicated VPC + EC2 + NLB + IAM + the auto-expiry reaper)
-2. Verify every node's hostname is its EC2 private DNS name (required by the AWS CCM)
-3. Generate `terraform/mke4.yaml` from the provisioned infrastructure
-4. Run `mkectl apply -f terraform/mke4.yaml`
-5. Optionally, per `config`: NFS server + `nfs-client` StorageClass (`nfs_enabled`), KOF (`kof_enabled`), k0rdent UI (`k0rdent_ui_enabled`)
-6. Print the deploy summary (URLs, credentials, IPs, expiry time) — reprint any time with `t show summary`
+### 5. Use the cluster
 
-## Recipes
+When the deploy finishes it prints a **summary**: cluster name and version, expiry date, node IPs, the load balancer URL, and the URLs and logins of any add-ons. Reprint it any time with `t show summary`.
 
-Each recipe is just **(1) a handful of edits in `config`** + **(2) one command**. All of them assume you're already inside a container with a valid AWS profile or credentials. Only the lines that differ from the shipped `config` are shown.
+The **kubeconfig lives inside the container** (`/root/.mke/mke.kubeconf`) and `KUBECONFIG` already points at it, so `kubectl`, `helm` and `k9s` work right away:
 
-### Deploy MKE4k v4.2.0 (online)
+```bash
+kubectl get nodes      # or: t status
+k9s
+t connect m1           # SSH to controller-1 (w1 = worker-1)
+```
+
+- **MKE dashboard:** `https://<load balancer DNS>` from the summary. `mkectl` prints the admin login at the end of the install output — note it down, it isn't saved by the tool.
+- **kubectl from your host:** copy the kubeconfig out with `docker cp mke4k-lab:/root/.mke/mke.kubeconf .` (online labs; an airgap API is only reachable through the bastion).
+
+### 6. Destroy when done
+
+```bash
+t destroy lab
+```
+
+Labs also delete themselves after `expiry_days` (default 3) — change it with `t expiry <days>`.
+
+## Examples
+
+Each example is a few lines in `config` plus one command. Only the lines that differ from the defaults are shown.
+
+### HA control plane, with LoadBalancer support
 
 ```bash
 # config
-ccm_enabled=true          # enable for LoadBalancer services / EBS volumes
-```
-
-```bash
-t deploy lab
-```
-
-### Deploy MKE4k v4.2.0 — HA control plane (3 controllers)
-
-```bash
-# config
-controller_count=3        # must be odd
+controller_count=3
 worker_count=2
 ccm_enabled=true
 ```
@@ -153,692 +105,106 @@ ccm_enabled=true
 t deploy lab
 ```
 
-### Deploy MKE4k v4.2.0 airgap
+### Airgapped MKE4k
 
-Cluster nodes sit in a private subnet with no internet; a bastion runs Harbor and the bundle is mirrored locally. CCM is auto-disabled (no AWS API from the private subnet).
-
-```bash
-# config
-airgap_registry_disk_gb=100      # holds Harbor + the mirrored bundle
-```
+Nodes have no internet; a bastion hosts the MSR4 registry. See [Airgap](#airgap).
 
 ```bash
 t deploy lab airgap
 ```
 
-> Airgap bundles only exist for GA versions. If your chosen `mke4k_version` has no published bundle, either pick a GA version or set `mke4k_bundle_url=` to a reachable bundle.
+### MKE3, then test the upgrade to MKE4k
 
-### Deploy MSR4 (Harbor) on a running MKE4k cluster
+The summary prints a ready-to-paste `mkectl upgrade` command.
 
-MSR4 needs a StorageClass, so deploy with NFS first, then add MSR4.
+```bash
+t deploy lab mke3
+```
+
+### KOF observability
+
+MKE 4.2+. Grafana over HTTPS, login in the summary. More: [docs/kof.md](docs/kof.md).
 
 ```bash
 # config
-nfs_enabled=true          # provides the nfs-client StorageClass MSR4 needs
-msr4_enabled=true
-msr4_replicas=1           # simple mode: built-in DB + Redis
-```
-
-```bash
-t deploy lab              # cluster + NFS StorageClass
-t deploy msr4             # then MSR4 on top
-```
-
-Access: `https://msr.<cluster>.local:33443` (add the node public IP to `/etc/hosts`) or `https://<node-public-dns>:33443`. Admin password is written to `terraform/msr4_credentials.txt`.
-
-### Deploy HA MSR4 (postgres-operator + redis-operator)
-
-HA schedules replicas only on workers (controllers are tainted), so you need `worker_count >= msr4_replicas`.
-
-```bash
-# config
-worker_count=2            # must be >= msr4_replicas
-nfs_enabled=true
-msr4_enabled=true
-msr4_replicas=2           # HA mode: external postgres + redis operators
+kof_enabled=true      # or run 't deploy kof' on a running lab
 ```
 
 ```bash
 t deploy lab
-t deploy msr4
 ```
 
-### Deploy MSR4 on an airgap MKE4k cluster
+### MSR4 registry on the cluster
 
 ```bash
 # config
-nfs_enabled=true
 msr4_enabled=true
 ```
 
 ```bash
-t deploy lab airgap
-t deploy msr4 airgap      # images/charts mirrored to the bastion Harbor
-t tunnel msr4             # then browse https://localhost:8444  (needs -p 8444:8444)
-```
-
-### Deploy KOF observability (with Grafana over HTTPS)
-
-Grafana and its HTTPS gateway are on by default, and `nfs_enabled=true` (the shipped default) provides the StorageClass KOF's PVCs need — so one line is enough:
-
-```bash
-# config
-kof_enabled=true          # auto-runs at the end of 't deploy lab'
-```
-
-```bash
 t deploy lab
-# Grafana: https://<nlb-dns>:8443  (login printed in the deploy summary)
+t deploy msr4         # https://<node>:33443, password in terraform/msr4_credentials.txt
 ```
 
-The default scope is `lean` (cluster monitoring only). For the complete observability + FinOps platform set `kof_mode="full"` — or skip `kof_enabled` entirely and deploy later on the running cluster:
+### MKE4k child cluster
+
+Online MKE4k, on a running lab. UI login and SSH included. More: [docs/child-cluster.md](docs/child-cluster.md).
 
 ```bash
-t deploy kof              # lean (default)
-t deploy kof full         # full platform
+t deploy child-cluster
+t connect m1-child
+t destroy child-cluster   # or just 't destroy lab' — it removes the child first
 ```
 
-### Deploy KOF on an airgap cluster
+## Airgap
 
-The MKE 4.2.0 offline bundle ships all KOF charts and images, so the bastion's Harbor already has everything after `t deploy lab airgap`. The Grafana gateway is auto-enabled in airgap (it is the only path to Grafana).
+In an airgap lab the cluster nodes and the load balancer are private; a bastion in the public subnet runs the MSR4 registry. The `t` commands handle the hop for you:
 
 ```bash
-# config
-kof_enabled=true          # auto-runs at the end of 't deploy lab airgap'
+t connect bastion      # SSH to the bastion
+t connect m1           # SSH to a node (through the bastion)
+t tunnel               # list the UI tunnels
+t tunnel dashboard     # MKE4k / MKE3 dashboard -> https://localhost:3000
+t tunnel grafana       # KOF Grafana            -> https://localhost:8443
+t tunnel msr4          # MSR4 UI                -> https://localhost:8444
+t tunnel k0rdent-ui    # k0rdent UI             -> https://localhost:8445
 ```
+
+Tunnels need the matching `-p` port mappings on `docker run`. The bastion's registry UI is also reachable directly at `https://<bastion-public-ip>`. Details: [docs/airgap.md](docs/airgap.md).
+
+## Everyday commands
+
+| Command | What it does |
+|---|---|
+| `t status` | `kubectl get nodes` (airgap: runs on the bastion; MKE3: via the client bundle) |
+| `t show summary` | Reprint the deploy summary (URLs, node IPs, add-on logins) |
+| `t show nodes` | Node IPs and load balancer DNS |
+| `t connect m1` / `w1` | SSH to controller-1 / worker-1 (`t connect m1 "cmd"` runs one command) |
+| `t config edit` | Edit the running cluster's configuration |
+| `t expiry <days>` | Change the auto-delete deadline (`t expiry off` disables it) |
+| `t expiry status` | Time left before auto-delete; local only, no AWS credentials (also shown when the shell starts) |
+| `t help` | All commands |
+
+## Emergency cleanup
+
+If the container (and with it the Terraform state) is lost, delete the lab's AWS resources by tag:
 
 ```bash
-t deploy lab airgap
-# or on an existing airgap cluster:
-t deploy kof airgap       # add full|lean before 'airgap' to override kof_mode
-
-t tunnel grafana          # then browse https://localhost:8443  (needs -p 8443:8443)
+./bin/cleanup-aws.sh <cluster-name> [region]      # e.g. mke4k-lab-a3f2 eu-central-1
 ```
 
-### Publish the k0rdent UI
+It lists everything first and asks before each step. It does not cover child clusters — see [docs/child-cluster.md](docs/child-cluster.md).
 
-```bash
-# config
-k0rdent_ui_enabled=true   # auto-runs at the end of 't deploy lab' / 't deploy lab airgap'
-```
+## Documentation
 
-```bash
-t deploy lab
-# or on an existing MKE4k cluster:
-t deploy k0rdent-ui
-# Online:  https://<nlb-dns>:8445   Airgap: t tunnel k0rdent-ui -> https://localhost:8445 (needs -p 8445:8445)
-```
-
-### Deploy MKE3 v3.8.2, then test the in-place upgrade to MKE4k
-
-```bash
-# config
-mke3_version="3.8.2"
-mke4k_version="v4.2.0"    # the upgrade target (shipped default)
-```
-
-```bash
-t deploy lab mke3         # provisions both NLBs + launchpad apply
-# the deploy summary prints a ready-to-paste mkectl upgrade command
-```
-
-In the airgap modes, the end of the deploy asks whether to prepare an upgrade:
-- `t deploy lab mke3-airgap` → MKE3 → MKE4k: uploads the MKE4k bundle to Harbor and generates `mke4.yaml` on the bastion.
-- `t deploy lab airgap` → MKE4k → MKE4k: prompts for a target version, uploads its bundle (using dual-path mode for v4.1.3), downloads `release-matrix.json`, and prints the upgrade command.
-
-## CLI Commands
-
-### MKE4k (default)
-
-| Command | Description |
+| Doc | Contents |
 |---|---|
-| `t deploy lab` | Full deployment: Terraform + mkectl apply |
-| `t deploy instances` | Terraform only (provision infrastructure) |
-| `t deploy cluster` | mkectl only (install MKE4k on existing instances) |
-| `t destroy cluster` | Uninstall MKE4k (mkectl reset --force) |
-| `t destroy lab` | Teardown all AWS infrastructure (terraform destroy) |
-
-### MKE3
-
-| Command | Description |
-|---|---|
-| `t deploy lab mke3` | Full: Terraform (both NLBs) + launchpad apply |
-| `t deploy instances mke3` | Terraform with MKE3 NLB enabled |
-| `t deploy cluster mke3` | launchpad apply on existing instances |
-| `t destroy cluster mke3` | Uninstall MKE3 (launchpad reset --force) |
-
-### Airgap (MKE4k)
-
-| Command | Description |
-|---|---|
-| `t deploy lab airgap` | Full: Terraform + registry setup + bundle upload + mkectl (from bastion) |
-| `t deploy instances airgap` | Terraform only (bastion + private-subnet nodes) |
-| `t deploy registry` | Setup MSR4 on bastion + download & upload MKE4k bundle |
-| `t deploy cluster airgap` | mkectl apply from bastion (registry must exist) |
-| `t destroy cluster airgap` | Uninstall MKE4k from bastion (mkectl reset) |
-
-### Airgap (MKE3)
-
-| Command | Description |
-|---|---|
-| `t deploy lab mke3-airgap` | Full: Terraform + registry + proxy + MKE3 images + launchpad (from bastion) |
-| `t deploy instances mke3-airgap` | Terraform only (bastion + private-subnet nodes + both NLBs) |
-| `t deploy registry mke3` | Setup MSR4 on bastion + download & upload MKE3 images |
-| `t deploy cluster mke3-airgap` | DNS + proxy + launchpad apply from bastion |
-| `t destroy cluster mke3-airgap` | Uninstall MKE3 from bastion (launchpad reset) |
-
-### NFS StorageClass (optional)
-
-| Command | Description |
-|---|---|
-| `t deploy nfs` | Setup NFS server + install the NFS provisioner / `nfs-client` StorageClass (cluster must exist; auto-detects airgap) |
-| `t deploy nfs mke3` | Same, for an MKE3 cluster (kubeconfig from the launchpad client bundle) |
-| `t connect nfs` | SSH to NFS server (direct or via bastion in airgap) |
-
-Set `nfs_enabled=true` in `config` (the shipped default) to automatically provision NFS during every `t deploy lab` variant (`mke4`, `mke3`, `airgap`, `mke3-airgap`). Or use `t deploy nfs` to add NFS to an already-running cluster.
-
-Creates a dedicated NFS server EC2 instance, installs the NFS client on all cluster nodes (`nfs-common` on Ubuntu, `nfs-utils` on RHEL), and deploys the [`nfs-subdir-external-provisioner`](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner) Helm chart with a default `nfs-client` StorageClass.
-
-**Airgap support:** Ubuntu nodes get `.deb` packages downloaded on the bastion and transferred via SCP; RHEL nodes install `nfs-utils` via dnf through the bastion's Squid proxy (RHUI). The provisioner image (`registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2`) is uploaded to a Harbor `nfs` project and the Helm chart is pulled on the bastion for offline install.
-
-### MSR4 (Harbor) on cluster
-
-| Command | Description |
-|---|---|
-| `t deploy msr4` | Deploy MSR4 (Harbor) on existing MKE4k cluster (online) |
-| `t deploy msr4 airgap` | Deploy MSR4 via bastion Harbor registry (airgap) |
-
-Set `msr4_enabled=true` in `config` to enable. Requires `nfs_enabled=true` for the PVC StorageClass; for HA (`msr4_replicas>=2`) you also need `worker_count >= msr4_replicas` — MKE4k taints controllers, so postgres/redis/harbor replicas only schedule on workers. `t deploy msr4` enforces this with a preflight die.
-
-- **Simple mode** (`msr4_replicas=1`): single Harbor pod with built-in PostgreSQL + Redis.
-- **HA mode** (`msr4_replicas>=2`): Zalando postgres-operator + OT-Container-Kit redis-operator installed as k0rdent `ServiceTemplate`s (Flux `HelmRepository` + k0rdent `ServiceTemplate`, namespace `k0rdent`). Harbor wired to external DB + Redis.
-
-Exposed as `NodePort 33443` (HTTPS) on every cluster node. Two-tier TLS PKI; server cert SANs include `msr.<cluster>.local`, all node IPs, and all node EC2 DNS names, so `https://<any-node>:33443` validates without `-k`.
-
-**Airgap support:** on `t deploy msr4 airgap`, the bastion pulls upstream images (skopeo) and charts (`helm pull`), then pushes them to Harbor under projects `postgres`, `redis`, `harbor`. The registry CA is added to the bastion's system trust so `helm push` over self-signed TLS works.
-
-**Access:**
-- Online: `https://msr.<cluster>.local:33443` (add `/etc/hosts: <node-public-ip> msr.<cluster>.local`) or `https://<node-public-dns>:33443`
-- Airgap: `t tunnel msr4` -> `https://localhost:8444` (requires `/etc/hosts: 127.0.0.1 msr.<cluster>.local` if you want to use the FQDN URL)
-- Admin credentials: generated on first deploy, saved to `terraform/msr4_credentials.txt`
-
-### KOF (observability & FinOps) on cluster
-
-| Command | Description |
-|---|---|
-| `t deploy kof [full\|lean]` | Deploy KOF self-monitoring stack on existing MKE4k cluster (online). Mode defaults to `kof_mode` (`lean`) |
-| `t deploy kof [full\|lean] airgap` | Deploy KOF from the bastion against the internal registry (airgap) |
-| `t destroy kof` | Uninstall KOF (helm uninstall + delete namespace; auto-detects airgap) |
-
-KOF (k0rdent Observability & FinOps) is deployed in **self-monitoring (M2M) mode**: the MKE4k cluster stores its own metrics, logs, and traces locally — no regional cluster, no child `ClusterDeployment`, no external DNS, no Istio. Targets KOF 1.8.x as shipped with k0rdent Enterprise 1.3.2 (**requires MKE 4.2.0+**). Two scopes: `full` (complete observability + FinOps platform) and `lean` (cluster monitoring only — drops tracing, FinOps, and dead dashboards). The default is `lean` (`kof_mode` in `config`); override per-run with `t deploy kof full`.
-
-Set `kof_enabled=true` in `config` to auto-deploy KOF at the end of `t deploy lab` / `t deploy lab airgap`, or run `t deploy kof` (online) / `t deploy kof airgap` against an already-running cluster. It **requires a StorageClass** — set `nfs_enabled=true` (or run `t deploy nfs`) first; the deploy resolves the cluster default StorageClass, falling back to `nfs-client`, and dies with an actionable message if neither exists.
-
-KOF installs as a **FluxCD-sequenced OCI umbrella Helm chart** (`oci://registry.mirantis.com/k0rdent-enterprise/charts/kof`) via **helm v3** (helm v4 has a webhook bug). The committed, version-pinned asset `kof/global-values.yaml` repoints every subchart image to `kof_registry`. The deploy is idempotent (`helm upgrade -i`).
-
-**Airgap:** the MKE 4.2.0 offline bundle ships all KOF charts and images, so after `t deploy lab airgap` the bastion's Harbor already holds everything KOF needs. `t deploy kof airgap` runs the whole install from the bastion (helm/kubectl/mkectl there), auto-derives `kof_registry` to `<registry-hostname>/mke`, auto-enables the Grafana gateway (the only path to Grafana in airgap), and prints `t tunnel grafana` access at the end.
-
-**MKE-monitoring reuse (default on):** `kof_reuse_mke_monitoring=true` reuses MKE4's built-in monitoring instead of duplicating it — drops KOF's own node-exporter and kube-proxy/coredns/apiserver scrapes (KOF already scrapes MKE's, same labels), makes KOF's kube-state-metrics custom-resource-only, and adds MKE's Prometheus as a Grafana datasource. The sub-option `kof_reuse_mke_kubelet=true` (also default) additionally drops KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted. Set both to `false` to run KOF's full scrape set alongside MKE's.
-
-The umbrella and mothership charts default every k0rdent (KCM) namespace to `kcm-system`, but MKE4k's k0rdent Enterprise build runs k0rdent in the `k0rdent` namespace. `kof_kcm_namespace` (default `k0rdent`) repoints all of them — the umbrella Flux `HelmRepository`/`HelmChart` objects, the KCM integration, and the per-`ServiceTemplate` Flux repos created by mothership's pre-install hooks — and the preflight dies if that namespace is missing. Because this is self-monitoring only, the `kof-regional` and `kof-child` charts (regional/child cluster templates) are disabled.
-
-Before installing, `t deploy kof` exempts the `kof` namespace and the `opentelemetry-operator` service account from MKE4k's built-in `ucpauthz` admission policy (via `mkectl config get` → patch `spec.apiServer.ucpauthz` → `mkectl apply`). Without this, the OpenTelemetry operator is blocked from creating its collector DaemonSets, so node/host-log collection silently never starts. The step is idempotent — it merges into any existing exemptions and skips the (heavyweight) `mkectl apply` when `kof` is already exempt.
-
-**Grafana (default on):** Mirantis no longer ships Grafana with KOF; `kof_grafana_enabled=true` (the default) has `t deploy kof` enable the `grafana-operator` + the mothership's datasources/dashboards/admin-secret, then apply a pinned Grafana instance CR (`kof/grafana.yaml`). The image is pinned to `<kof_registry>/grafana/grafana:<kof_grafana_image_tag>` (default tag `11.0.0` — the doc's `10.4.18-security-01` is not in the k0rdent-enterprise registry; use whatever tag your registry actually has). The admin login (from secret `grafana-admin-credentials`) is resolved and printed in the deploy output (`Grafana login: <user> / <pass>`).
-
-**Grafana over HTTPS (default on, touches terraform when online):** `kof_grafana_gateway_enabled=true` (the default; requires `kof_grafana_enabled=true`) exposes Grafana via a dedicated Envoy **Gateway API** gateway instead of port-forward. Online, `t deploy kof` also runs `terraform apply` to add an NLB listener (`kof_grafana_lb_port`, default `8443`) + a security-group rule for a pinned Envoy NodePort (`kof_grafana_nodeport`, default `33002`), and applies `kof/grafana-gateway.yaml` (a self-contained `Issuer`/`Certificate`/`EnvoyProxy`/`Gateway`/`HTTPRoute` in the `kof` namespace, on the `mke-gateway-ingress` GatewayClass). TLS is self-signed (cert SANs = NLB DNS + node public IPs), terminated at the gateway; the NLB listener is plain TCP pass-through. Access: `https://<nlb-dns>:8443` (or `https://<node-public-ip>:33002`) — no `/etc/hosts` needed (dedicated listener, no host routing). dex/OIDC is not wired (Grafana's admin login is used). In airgap the terraform step is skipped (internal NLB) and access is via `t tunnel grafana` → `https://localhost:8443`. Set the flag to `false` to fall back to port-forward: `kubectl -n kof port-forward svc/grafana-vm-service 3000:3000`.
-
-**Access (built-in VMUI, always available):**
-- Logs: `kubectl -n kof port-forward svc/kof-storage-victoria-logs-cluster-vlselect 9471:9471` → `http://localhost:9471/select/vmui/`
-- Metrics: `kubectl -n kof port-forward svc/vmselect-cluster 8481:8481` → `http://localhost:8481/select/0/vmui/`
-- Unified auth proxy: `svc/vmauth:8427` (basic-auth; the Grafana datasources point here)
-
-**Example — deploy KOF with Grafana over HTTPS on a running lab:**
-
-```bash
-# 1. Ensure a StorageClass exists (KOF's PVCs need one). nfs_enabled=true (the
-#    shipped default) provisions it during 't deploy lab'; otherwise add it on demand:
-t deploy nfs
-
-# 2. Deploy KOF on the existing cluster. Grafana + the HTTPS gateway are on by
-#    default, so this also runs 'terraform apply' to add the NLB listener +
-#    SG rule (idempotent). Default scope is lean; use 't deploy kof full' for
-#    the complete observability + FinOps platform.
-t deploy kof
-
-# The deploy output ends with the access block, e.g.:
-#   KOF access (self-monitoring / M2M):
-#     Grafana (HTTPS): https://<nlb-dns>:8443  (self-signed; accept the cert)
-#                      or https://<node-public-ip>:33002
-#     Grafana login:  admin / <generated-password>
-
-# 3. Tear down just KOF when done (leaves the cluster intact):
-t destroy kof
-```
-
-> With `kof_enabled=true` in `config`, step 2 runs automatically at the end of `t deploy lab` — no separate `t deploy kof` needed. The same applies to `t deploy lab airgap` (KOF then installs from the bastion; Grafana via `t tunnel grafana`).
-
-### k0rdent UI
-
-| Command | Description |
-|---|---|
-| `t deploy k0rdent-ui` | Rotate the k0rdent UI password + publish the UI over HTTPS (auto-detects airgap) |
-| `t destroy k0rdent-ui` | Remove the k0rdent UI gateway resources |
-| `t tunnel k0rdent-ui` | Airgap: tunnel → `https://localhost:8445` |
-
-MKE4k ships the k0rdent Enterprise UI (service `kcm-k0rdent-ui` in namespace `k0rdent`) as ClusterIP-only with a fixed default basic-auth password. With `k0rdent_ui_enabled=true` (required — the command dies otherwise), `t deploy k0rdent-ui`:
-
-1. Runs `terraform apply` to add an NLB listener (`k0rdent_ui_lb_port`, default `8445`) + target group forwarding to a pinned Envoy NodePort (`k0rdent_ui_nodeport`, default `33003`). Idempotent; preserves the deployed mke3/airgap topology. (The security-group rules for both ports are always present.)
-2. Rotates the UI password to a random value by patching `Management/kcm` (`spec.core.kcm.config.k0rdent-ui.auth.basic`) and waits for the rollout. Credentials are saved to `terraform/k0rdent_ui_credentials.txt` (user `admin`) and reused on later runs.
-3. Applies `k0rdent-ui/k0rdent-ui-gateway.yaml` (self-signed `Issuer`/`Certificate` + `EnvoyProxy`/`Gateway`/`HTTPRoute` in namespace `k0rdent`). Cert SANs = NLB DNS + node IPs. In airgap the Envoy data-plane image is pinned to MKE's own envoy image so it pulls from Harbor.
-
-It runs automatically at the end of `t deploy lab` / `t deploy lab airgap` when enabled. Nothing new is pulled, so airgap needs no extra registry uploads.
-
-**Access:** online `https://<nlb-dns>:8445` or `https://<node-public-ip>:33003`; airgap `t tunnel k0rdent-ui` → `https://localhost:8445` (needs `-p 8445:8445`). The login is printed at the end of the deploy.
-
-`t destroy k0rdent-ui` deletes the gateway resources, then removes the NLB listener + target group with a **targeted** `terraform destroy` (the cluster is never touched). The rotated password stays in `Management/kcm`. Set `k0rdent_ui_enabled=false` in `config` as well — otherwise the next full terraform apply (`t deploy lab`, online `t deploy kof`, ...) recreates the listener.
-
-### Auto-expiry
-
-| Command | Description |
-|---|---|
-| `t expiry` | Show the current auto-expiry deadline |
-| `t expiry <days>` | Re-arm the deadline to `<days>` (≥1) days from **now** |
-| `t expiry off` | Disable auto-expiry (the lab will not self-delete) |
-| `t expiry status` | One-line local status (time left / passed / disabled / no lab); needs no AWS credentials and runs on every shell start |
-
-Every lab deletes itself `expiry_days` (default `3`) days after creation unless `t destroy lab` runs first. Terraform provisions a reaper entirely inside AWS — an EventBridge Scheduler one-shot that invokes a Lambda (`terraform/reaper.py`) — so it fires even if your container or laptop is off, and works in airgap too (the Lambda runs outside the lab VPC). The Lambda deletes every resource tagged with the lab's `Cluster` tag (EC2, NLBs + target groups, VPC and dependencies, CCM IAM, key pair), then removes its own schedule, roles and function.
-
-- `t destroy lab` removes the schedule with everything else, so the reaper only fires on abandoned labs.
-- `t expiry <days>|off` does a **targeted** `terraform apply` of the reaper resources only — the running cluster is never touched. The override is stored in `.expiry-days` / `.expiry-base` (project root) and takes precedence over `config`; `t destroy lab` clears it.
-- `expiry_days=0` in `config` disables the reaper from the start.
-- `expiry_dry_run=true` makes the Lambda log what it *would* delete (CloudWatch) without deleting anything. Invoke it on demand: `aws lambda invoke --function-name <cluster_name>-reaper /dev/stdout`.
-- The deadline is shown in the deploy summary, by `t expiry`, and by `t expiry status` (also printed when the container shell starts).
-
-### Cluster configuration
-
-| Command | Description |
-|---|---|
-| `t config get [mke4\|mke3]` | Pull the **running** cluster's config to a local file |
-| `t config apply [mke4\|mke3]` | Push the edited file back to the cluster |
-| `t config edit [mke4\|mke3]` | Pull → `$EDITOR` → push (skipped if you saved no changes) |
-
-Reads and writes the configuration of a cluster that is already up — the variant suffix
-follows the same convention as `t deploy lab mke3`, and `mke4` is the default.
-
-| Variant | Local file | Get | Apply |
-|---|---|---|---|
-| `mke4` (default) | `terraform/mke4.yaml` | `mkectl config get` | `mkectl apply -f` |
-| `mke3` | `terraform/mke3-config.toml` | `GET /api/ucp/config-toml` | `PUT /api/ucp/config-toml` |
-
-MKE3 uses the [MKE configuration file API](https://docs.mirantis.com/mke/3.9/ops/administer-cluster/configure-an-mke-cluster/use-an-mke-configuration-file.html):
-a bearer token from `POST /auth/login` (URL from the MKE3 NLB, credentials from
-`terraform/mke3_credentials.txt`), then a TOML `GET`/`PUT`. No manual login needed.
-
-**Airgap is auto-detected.** The MKE3 NLB is internal, so login and transfer both run on
-the bastion over SSH — the token never leaves the bastion. The MKE4k path runs `mkectl` on
-the bastion the same way. No tunnel or port mapping required.
-
-`apply` asks for confirmation (pushing config restarts MKE components) and first saves the
-**running** config to `<file>.bak`, so a bad edit can be rolled back by copying the backup
-over the file and applying again.
-
-```bash
-# MKE3 — change the session lifetime on a running cluster
-t config get mke3                        # -> terraform/mke3-config.toml
-vi terraform/mke3-config.toml            # [auth.sessions] lifetime_minutes = 90
-t config apply mke3                      # confirm at the prompt
-
-# Or in one step
-t config edit mke3
-
-# MKE4k (default)
-t config get                             # -> terraform/mke4.yaml
-t config apply
-```
-
-> `t config get` (mke4) overwrites `terraform/mke4.yaml` — the same file `t deploy cluster`
-> generates. That is expected; the next deploy regenerates it from `config` + Terraform
-> outputs.
-
-### Tunnels (airgap)
-
-| Command | Description |
-|---|---|
-| `t tunnel` | Show available SSH tunnels with manual commands |
-| `t tunnel dashboard` | MKE4k Dashboard tunnel -> https://localhost:3000 |
-| `t tunnel mke3` | MKE3 Dashboard tunnel -> https://localhost:3000 |
-| `t tunnel registry` | No tunnel — prints the bastion Harbor URL `https://<bastion-public-ip>` (publicly reachable; SG opens 443) |
-| `t tunnel msr4` | MSR4 Harbor UI tunnel -> https://localhost:8444 |
-| `t tunnel k0rdent-ui` | k0rdent UI tunnel -> https://localhost:8445 (`k0rdent_ui_lb_port`) |
-| `t tunnel grafana` | KOF Grafana tunnel -> https://localhost:8443 (`kof_grafana_lb_port`) |
-
-Each tunnel needs the matching `-p` mapping on `docker run`. `t tunnel` with no argument also prints a manual SSH command for forwarding the Kubernetes API (`6443`) through the bastion.
-
-### General
-
-| Command | Description |
-|---|---|
-| `t status` | Show cluster node status (`kubectl get nodes -o wide`). Works in all modes: airgap runs it on the bastion; MKE3 uses the launchpad client bundle |
-| `t show nodes` | Print IPs and NLB DNS name |
-| `t show summary` | Reprint the deploy summary box (credentials, URLs, IPs, expiry) |
-| `t gen client-bundle [mke3]` | MKE3: download the admin client bundle (`cd <dir> && source env.sh`); in airgap it is generated on the bastion |
-| `t gen client-bundle mke4` | Print the MKE4k kubeconfig path |
-| `t connect bastion` | SSH to bastion/registry host (airgap only) |
-| `t connect nfs` | SSH to NFS server (when `nfs_enabled=true`) |
-| `t connect m1` | SSH to controller-1 (via ProxyCommand when airgap) |
-| `t connect w1` | SSH to worker-1 |
-| `t connect <node> "cmd"` | Run a single command on a node |
-| `t connect <ip>` | SSH to any raw IP or hostname |
-
-> **Local `kubectl` in airgap:** the copied `~/.mke/mke.kubeconf` points at the internal NLB, which the container can't reach. `t status` handles this by running on the bastion; for your own `kubectl` commands, use `t connect bastion` (`KUBECONFIG=~/.mke/mke.kubeconf`) or forward 6443 as shown by `t tunnel`. For MKE3, use the client bundle (`t gen client-bundle`).
-
-**Container shell extras** (`.bashrc`): `connect m1` works as a shortcut for `t connect m1`; `k` = `kubectl`, `h` = `helm`; `KUBECONFIG` is set automatically once `~/.mke/mke.kubeconf` exists; `config` is sourced so its variables are available in the shell.
-
-## Project Structure
-
-```
-mke4k-lab/
-├── config                        # User-edited config (edit this)
-├── Dockerfile                    # Two-stage image: terraform, kubectl, helm, aws, k9s, yq
-├── .bashrc                       # Container shell: aliases, connect shortcut, KUBECONFIG
-├── kof/                          # KOF assets: global-values.yaml, grafana*.yaml, profiles/{full,lean}.yaml
-├── k0rdent-ui/                   # k0rdent UI Envoy gateway manifest
-├── bin/
-│   ├── t                         # Thin launcher
-│   ├── t-commandline.bash        # CLI implementation
-│   └── cleanup-aws.sh            # Emergency AWS cleanup (when state is lost)
-└── terraform/
-    ├── vpc.tf                    # Dedicated VPC, IGW, public subnet, route table
-    ├── main.tf                   # Provider, SG, keypair, AMI lookup
-    ├── variables.tf              # Variable declarations
-    ├── controller.tf             # Controller EC2 instances
-    ├── worker.tf                 # Worker EC2 instances
-    ├── loadbalancer.tf           # MKE4k NLB + IP-type target groups + listeners
-    ├── mke3_loadbalancer.tf      # MKE3 NLB (conditional on mke3_enabled)
-    ├── airgap.tf                 # Bastion + private subnet (conditional on airgap_enabled)
-    ├── nfs.tf                    # NFS server EC2 (conditional on nfs_enabled)
-    ├── iam.tf                    # IAM role + CCM policy + instance profile
-    ├── expiry.tf                 # Auto-expiry reaper: EventBridge schedule + Lambda + IAM
-    ├── reaper.py                 # Reaper Lambda source (zipped at apply time)
-    └── outputs.tf                # lb_dns_name, IPs, DNS names, ssh key path, bastion IPs, NFS IPs, expiry_time
-```
-
-## What Terraform Creates
-
-### Always created
-
-| Resource | Details |
-|---|---|
-| `aws_vpc` + `aws_internet_gateway` | Dedicated VPC (`172.31.0.0/16`) with IGW — full isolation per lab |
-| `aws_subnet` (public) | `172.31.0.0/24` with `map_public_ip_on_launch` |
-| `tls_private_key` + `aws_key_pair` | RSA-4096 key pair, PEM saved to `terraform/aws_private.pem` |
-| `aws_security_group` | Ports 22, 443, 6443, 9443, 33001 (ingress), 33443 (MSR4), 30080, `kof_grafana_nodeport` (33002), `k0rdent_ui_nodeport` (33003) + intra-cluster. The Grafana / k0rdent UI ports are always open, whether or not the feature is enabled |
-| `aws_instance` (controllers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.xlarge` (configurable), 50GB gp3 |
-| `aws_instance` (workers) | Ubuntu or RHEL (`os_name`/`os_version`), `m5a.large` (configurable), 50GB gp3 |
-| `aws_lb` (NLB) | Public NLB in public subnet (internal in airgap) |
-| `aws_lb_target_group` x3 | kube-api (6443), controller-join (9443), ingress (NLB 443 → 33001) — all **IP-type** |
-| `aws_iam_role` + `aws_iam_policy` | AWS CCM minimum permissions (when `ccm_enabled`, auto-disabled in airgap) |
-| `aws_iam_instance_profile` | Attached to all EC2 instances (when `ccm_enabled`) |
-
-### Auto-expiry (`expiry_days > 0`)
-
-| Resource | Details |
-|---|---|
-| `time_offset` | Fixes the expiry moment (`expiry_base` + `expiry_days`) |
-| `aws_lambda_function` (reaper) | `<cluster_name>-reaper`, runs `reaper.py`; `DRY_RUN` from `expiry_dry_run` |
-| `aws_scheduler_schedule` | EventBridge Scheduler one-shot `at()` that invokes the Lambda |
-| `aws_iam_role` x2 + policies | Scoped roles for the Lambda and the scheduler |
-
-### KOF Grafana / k0rdent UI (`kof_grafana_gateway_enabled` / `k0rdent_ui_enabled`)
-
-| Resource | Details |
-|---|---|
-| NLB listener + IP-type target group | Grafana: `kof_grafana_lb_port` (8443) → `kof_grafana_nodeport` (33002); k0rdent UI: `k0rdent_ui_lb_port` (8445) → `k0rdent_ui_nodeport` (33003). TCP pass-through (online only; airgap uses tunnels) |
-
-### MKE3 mode (`mke3_enabled`)
-
-| Resource | Details |
-|---|---|
-| `aws_lb` (MKE3 NLB) | Second NLB for MKE3 UI (443) + API (6443) — IP-type targets. Internal when `airgap_enabled` |
-
-### Airgap mode (`airgap_enabled`)
-
-| Resource | Details |
-|---|---|
-| `aws_subnet` (private) | `172.31.1.0/24`, no IGW route — true network isolation |
-| `aws_route_table` | Only local VPC routing (no internet) |
-| `aws_instance` (bastion) | Public subnet, configurable size, runs MSR4 (Harbor) |
-| `aws_lb` (NLB) | Switched to **internal**, placed in private subnet |
-| Controllers + workers | Placed in the private subnet (no public IPs), CCM auto-disabled |
-
-### NFS mode (`nfs_enabled`)
-
-| Resource | Details |
-|---|---|
-| `aws_instance` (NFS server) | Public subnet (online) or private subnet (airgap). Runs `nfs-kernel-server` |
-
-## After Deployment
-
-```bash
-# Check node status
-t status
-
-# SSH to a controller
-t connect m1
-
-# Use kubectl directly
-kubectl --kubeconfig ~/.mke/mke.kubeconf get nodes
-
-# Airgap: access MKE4k Dashboard (requires -p 3000:3000 on docker run)
-t tunnel dashboard
-# then browse https://localhost:3000
-
-# Airgap: access MKE3 Dashboard (requires -p 3000:3000 on docker run)
-t tunnel mke3
-# then browse https://localhost:3000
-
-# Airgap: access Harbor UI — the bastion has a public IP and the SG opens 443,
-# so browse it directly (no tunnel/port mapping needed):
-#   https://<bastion-public-ip>      (see `t show nodes` for the IP)
-
-# Airgap: access MSR4 (Harbor) UI (requires -p 8444:8444 on docker run)
-t tunnel msr4
-# then browse https://localhost:8444
-
-# Airgap: access the k0rdent UI (requires -p 8445:8445 on docker run)
-t tunnel k0rdent-ui
-# then browse https://localhost:8445
-
-# Airgap: access KOF Grafana (requires -p 8443:8443 on docker run)
-t tunnel grafana
-# then browse https://localhost:8443
-
-# Teardown
-t destroy lab
-```
-
-## Configuration Reference
-
-### Shared infrastructure
-
-| Variable | Default | Description |
-|---|---|---|
-| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, the first `t deploy lab\|instances` asks for your name (interactive terminal only; sanitised to a-z, 0-9, max 10 chars) → `mke4k-lab-<name>` plus an `Owner` tag on every resource; non-interactive runs (or an empty answer) get a random 4-char suffix (e.g. `mke4k-lab-a3f2`). Persisted in `.cluster-id` / `.owner`. Set an explicit name (≤ 20 chars) to skip the prompt |
-| `expiry_days` | `3` | Auto-delete the whole lab this many days after creation (`0` = never). See [Auto-expiry](#auto-expiry) |
-| `expiry_dry_run` | `false` | Reaper only logs what it would delete (CloudWatch) |
-| `controller_count` | `1` | Number of controller nodes (use 3 for HA) |
-| `worker_count` | `1` | Number of worker nodes |
-| `controller_flavor` | `m5a.xlarge` | EC2 instance type for controllers |
-| `worker_flavor` | `m5a.large` | EC2 instance type for workers |
-| `region` | `eu-central-1` | AWS region |
-| `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu) |
-| `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn) |
-| `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. MKE3: adds `--cloud-provider=aws`. Auto-disabled in airgap. (If the line is removed from `config`, the fallback is `true`) |
-| `debug` | `true` | `true` adds `-l debug` to mkectl (all modes including airgap) |
-
-### MKE4k settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `mke4k_version` | `v4.2.0` | MKE4k / mkectl version. Override the mkectl download with the `MKECTL_DOWNLOAD_URL` env var |
-
-### k0rdent UI settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI at the end of `t deploy lab` / `t deploy lab airgap`; also required for `t deploy k0rdent-ui`. **Touches terraform** (NLB listener + SG rule) |
-| `k0rdent_ui_nodeport` | `33003` | NodePort the Envoy gateway is pinned to (range 32768-35535; 33001/33002/33443 taken) |
-| `k0rdent_ui_lb_port` | `8445` | NLB listener port (online) / local port of `t tunnel k0rdent-ui` (airgap) |
-
-### MKE3 settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `launchpad_version` | `1.5.15` | Launchpad binary version (no `v` prefix) |
-| `mke3_version` | `3.8.2` | MKE3 version |
-| `mcr_version` | `25.0.14` | MCR (Docker engine) version |
-| `mcr_channel` | `stable-25.0.14` | Must match `mcr_version` exactly |
-| `mke3_admin_username` | `admin` | MKE3 UI admin user |
-
-### Airgap settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `airgap_registry_flavor` | `t3.xlarge` | EC2 instance type for the bastion/registry host |
-| `airgap_registry_disk_gb` | `100` | Root volume size (GB) for bastion (Harbor data + bundle) |
-| `airgap_msr_version` | `v4.13.3` | MSR4 (Harbor) offline installer version |
-| `mke4k_bundle_url` | *(auto)* | Override the MKE4k bundle download URL |
-| `mke3_bundle_url` | *(auto)* | Override the MKE3 image bundle download URL |
-
-### NFS settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `nfs_enabled` | `true` | Provisions NFS server EC2, installs the NFS client on nodes, deploys nfs-subdir-external-provisioner. (If the line is removed from `config`, the fallback is `false`) |
-| `nfs_flavor` | `t3.small` | EC2 instance type for the NFS server |
-| `nfs_disk_gb` | `150` | Root volume size (GB) for the NFS server. Sized with headroom for KOF's VictoriaMetrics/Logs/Traces PVCs, which land on `nfs-client` |
-| `nfs_export_path` | `/srv/nfs/data` | NFS export path on the server |
-
-### MSR4 settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `msr4_enabled` | `false` | Enables `t deploy msr4` / `t deploy msr4 airgap` (standalone; not auto-run during `t deploy lab`) |
-| `msr4_version` | `4.13.3` | Harbor chart version deployed on the cluster (separate from `airgap_msr_version` which controls the bastion registry) |
-| `msr4_replicas` | `1` | `1` = simple (built-in DB+Redis); `>=2` = HA (postgres-operator + redis-operator). HA requires `worker_count >= msr4_replicas` |
-| `msr4_postgres_version` | `1.15.1` | Zalando postgres-operator chart version (HA only) |
-| `msr4_redis_operator_version` | `0.24.0` | OT-Container-Kit redis-operator chart version (HA only) |
-| `msr4_redis_replication_version` | `0.16.13` | OT-Container-Kit redis-replication chart version (HA only) |
-| `msr4_storage_size` | `10Gi` | PVC size for the MSR4 registry volume (requires `nfs_enabled=true`) |
-
-### KOF settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `kof_enabled` | `false` | Auto-deploy KOF (self-monitoring/M2M) at the end of `t deploy lab` / `t deploy lab airgap`. Even when `false`, KOF can be deployed later with `t deploy kof` / `t deploy kof airgap`. Requires a StorageClass |
-| `kof_mode` | `lean` | Deployment scope: `full` (complete observability + FinOps platform) or `lean` (cluster monitoring only). Override per-run: `t deploy kof full` / `t deploy kof lean` |
-| `kof_version` | `1.8.1` | KOF Helm umbrella-chart version; must match the cluster's k0rdent Enterprise release (`kubectl get mgmt`): `1.8.1` = k0rdent 1.3.2 / MKE 4.2.0, `1.4.1` = k0rdent 1.4.1 / MKE 4.2.1. Only these two are tested |
-| `kof_storage_size` | `10Gi` | PVC size for the VictoriaMetrics / VictoriaLogs / VictoriaTraces volumes (doc default is 100Gi) |
-| `kof_storage_ha` | `true` | Keep VictoriaMetrics/VictoriaLogs in HA (cluster) topology. Applies to both modes |
-| `kof_registry` | `registry.mirantis.com/k0rdent-enterprise` | Image/chart registry. In airgap it is auto-derived to `<registry-hostname>/mke`; override only for a different custom registry |
-| `kof_kcm_namespace` | `k0rdent` | Namespace where k0rdent (KCM) runs. KOF's upstream default is `kcm-system`, but MKE4k's k0rdent Enterprise uses `k0rdent`; the KOF Flux objects + KCM integration are created here |
-| `kof_grafana_enabled` | `true` | Deploy Grafana (grafana-operator + datasources/dashboards + the `kof/grafana.yaml` instance CR). Grafana is no longer shipped with KOF by default |
-| `kof_grafana_image_tag` | `11.0.0` | Grafana image tag in `<kof_registry>/grafana/grafana` (the registry ships `11.0.0`, not the doc's `10.4.18-security-01`) |
-| `kof_grafana_gateway_enabled` | `true` | Expose Grafana over HTTPS via a dedicated Envoy Gateway + NLB listener (requires `kof_grafana_enabled`). **Touches terraform** online — `t deploy kof` runs `terraform apply`. In airgap the gateway is auto-enabled regardless (access via `t tunnel grafana`) |
-| `kof_grafana_nodeport` | `33002` | NodePort the Grafana Envoy gateway is pinned to (opened in the cluster SG; NLB target group forwards here). Range 32768-35535 |
-| `kof_grafana_lb_port` | `8443` | NLB listener port for Grafana (TCP pass-through; the gateway terminates TLS). In airgap this is the local port of `t tunnel grafana` |
-| `kof_reuse_mke_monitoring` | `true` | Reuse MKE4's built-in monitoring instead of duplicating it (drops KOF's node-exporter + kube-proxy/coredns/apiserver scrapes, KSM custom-resource-only, adds MKE's Prometheus as Grafana datasource) |
-| `kof_reuse_mke_kubelet` | `true` | Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted (~2x otherwise) |
-| `kof_lean_prune_folders` | `Istio,Opencost,Victoria Traces` | Lean mode: Grafana dashboard folders to drop (comma-separated) |
-| `kof_lean_prune_dashboards` | `kps-nodes-aix,kps-nodes-darwin` | Lean mode: individual dashboards to drop (comma-separated) |
-| `kof_sf_notifier_enabled` | `false` | Route alerts with severity critical\|warning\|error to the sf-notifier webhook. sf-notifier itself is deployed separately by hand — leave `false` unless it is running |
-
-## Airgap Architecture
-
-The airgap deployment creates true network isolation: cluster nodes in a private subnet with no internet access, and a bastion/registry host in a public subnet running MSR4 (Harbor).
-
-```
-                    Internet
-                       |
-              +--------+--------+
-              |  Dedicated VPC  |
-              |   172.31.0.0/16   |
-              |                 |
-    +---------+---------+       |
-    |   Public Subnet   |       |
-    |   172.31.0.0/24     |       |
-    |   (has IGW)       |       |
-    |                   |       |
-    |  +-----------+    |       |
-    |  |  Bastion  |    |       |
-    |  |  (MSR4)   |<---+------+-- SSH from user
-    |  |  Pub IP   |    |       |
-    |  +-----------+    |       |
-    +---------+---------+       |
-              | (VPC routing)   |
-    +---------+---------+       |
-    |  Private Subnet   |       |
-    |  172.31.1.0/24    |       |
-    |  (no IGW route)   |       |
-    |                   |       |
-    |  +-----------+    |       |
-    |  | Int. NLB  |<---+------+-- kubectl / MKE UI (via tunnel)
-    |  +-----------+    |       |
-    |  +------------+   |       |
-    |  | Controller |   |       |
-    |  | (priv IP)  |   |       |
-    |  +------------+   |       |
-    |  +------------+   |       |
-    |  |   Worker   |   |       |
-    |  | (priv IP)  |   |       |
-    |  +------------+   |       |
-    +-------------------+       |
-              +-----------------+
-```
-
-**Traffic flows (MKE4k airgap):**
-- User -> Bastion: SSH (port 22) via public IP
-- User -> NLB: via SSH tunnel through bastion (NLB is internal, not internet-facing)
-- NLB -> Cluster nodes: ports 6443, 9443, 33001 via private IPs (IP-type targets, supports hairpin)
-- Cluster nodes -> Bastion: Harbor registry (443) via bastion private IP (VPC routing)
-- Bastion -> Cluster nodes: SSH (22) for mkectl (VPC routing)
-- Cluster nodes -> Internet: **blocked** (no IGW route in private subnet)
-
-**Additional traffic flows (MKE3 airgap, and RHEL nodes in any airgap mode):**
-- Cluster nodes -> Bastion: Squid proxy (3128) for MCR apt/dnf package installation (RHEL nodes also use it for RHUI OS packages, e.g. `nfs-utils`)
-- Squid proxy -> Internet: HTTPS CONNECT to `*.mirantis.com`, `*.docker.com`, `*.ubuntu.com`, `*.redhat.com` (whitelisted domains only)
-- Cluster nodes -> Bastion: Docker image pulls from Harbor `mke3` project (443)
-- MKE3 NLB (internal): ports 443 (MKE3 UI) + 6443 (kube-api) — same private subnet as MKE4k NLB
-
-## Emergency Cleanup
-
-If you lose Terraform state (e.g. removed the Docker container), use the cleanup script to find and delete resources by cluster tag:
-
-```bash
-./bin/cleanup-aws.sh <cluster-name> [region]
-# e.g.
-./bin/cleanup-aws.sh mke4k-lab-a3f2 eu-central-1
-```
-
-The script shows all discovered resources first, then asks for confirmation before each deletion step.
-
-It does **not** delete the auto-expiry reaper (Lambda `<cluster>-reaper`, its EventBridge schedule and IAM roles). If left alone, the reaper still fires at the deadline, finds nothing left to delete, and removes itself. Delete it by hand if you want it gone sooner.
-
-## Generated files
-
-Everything below is git- and docker-ignored and lives inside the container:
-
-| File | Contents |
-|---|---|
-| `.cluster-id`, `.owner` | Cluster name suffix and owner name (project root) |
-| `.expiry-days`, `.expiry-base` | `t expiry` override (project root) |
-| `terraform/terraform.tfstate`, `terraform.tfvars` | Terraform state and generated variables |
-| `terraform/aws_private.pem` | SSH key for all instances |
-| `terraform/mke4.yaml` (+ `.bak`) | MKE4k config (generated, or pulled by `t config get`) |
-| `terraform/launchpad.yaml`, `mke3-config.toml` (+ `.bak`) | MKE3 launchpad config / running MKE3 config |
-| `terraform/mke3_credentials.txt` | MKE3 admin login |
-| `terraform/registry_credentials.txt`, `registry_ca.crt` | Bastion Harbor login and CA (airgap) |
-| `terraform/msr4_credentials.txt`, `msr4_*.crt/.key`, `msr4_redis_password.txt` | MSR4 admin login and TLS PKI |
-| `terraform/k0rdent_ui_credentials.txt` | k0rdent UI login |
-| `~/.mke/mke.kubeconf` | MKE4k kubeconfig |
+| [CLI reference](docs/commands.md) | Every `t` command, `t config get/apply/edit`, tunnels |
+| [Configuration](docs/configuration.md) | Every `config` setting |
+| [Airgap](docs/airgap.md) | Airgap deploys, access, architecture and traffic flows |
+| [Add-ons](docs/addons.md) | NFS, MSR4, k0rdent UI |
+| [KOF](docs/kof.md) | KOF observability: modes, Grafana, airgap |
+| [Child cluster](docs/child-cluster.md) | MKE4k child clusters: prerequisites, access, SSH, credentials, teardown |
+| [Development](docs/development.md) | Build the image, `run.sh` + AWS SSO, tests, project layout, what Terraform creates |
+
+AI agents working in this repo: read [AGENTS.md](AGENTS.md) first.

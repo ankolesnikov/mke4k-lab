@@ -1,7 +1,7 @@
 # AGENTS.md
 
 How AI agents (Claude Code, Codex, Cursor, etc.) should **use** and **change** this repo.
-Read this first, then `README.md` (user docs) and `CLAUDE.md` (architecture + deploy-flow detail).
+Read this first, then `README.md` + `docs/` (user docs) and `CLAUDE.md` (architecture + deploy-flow detail).
 This file is the rulebook; those two are the reference — don't duplicate them here.
 
 ## 1. What you are operating
@@ -18,8 +18,9 @@ host checkout (bind-mounted at `/mke4k-lab`); with a bare `docker run` it is the
 
 1. **Never run a cost- or state-changing command without the user's explicit go-ahead for that
    command in this conversation.** That is: `t deploy *`, `t destroy *`, `t expiry <n>|off`,
-   `t config apply|edit`, `terraform apply|destroy`, `bin/cleanup-aws.sh`, `mkectl apply|reset`,
-   `launchpad apply|reset`. Approval for one does not carry over to the next.
+   `t config apply|edit`, `t rotate child-creds`, `terraform apply|destroy`, `bin/cleanup-aws.sh`,
+   `mkectl apply|reset`, `launchpad apply|reset`. `t deploy child-cluster` also creates AWS resources
+   that Terraform, the reaper and `cleanup-aws.sh` do not track (CAPA owns them). Approval for one does not carry over to the next.
 2. **`t destroy lab` does not prompt** (`terraform destroy -auto-approve`). Before running it,
    show the user the target (`t show nodes`, cluster name from `.cluster-id`) and get a yes.
 3. **Never delete or overwrite** `terraform/terraform.tfstate*`, `terraform/aws_private.pem`,
@@ -32,7 +33,7 @@ host checkout (bind-mounted at `/mke4k-lab`); with a bare `docker run` it is the
    never copy those lines into chat, PRs or commits.
 5. **Never set `expiry_days=0` / `t expiry off` on your own** — the reaper is the safety net for
    forgotten labs.
-6. **Read-only commands are always fine**: `t status` (all modes — airgap runs on the bastion, MKE3 via
+6. **Read-only commands are always fine**: `t status` and `t status child` (all modes — airgap runs on the bastion, MKE3 via
    the client bundle; on first use in airgap it installs `kubectl` on the bastion, lab tooling only),
    `t show nodes`, `t show summary` (output contains passwords — rule 4), `t expiry` (no arg), `t expiry status`
    (local Terraform output only — no AWS credentials needed),
@@ -57,7 +58,7 @@ host checkout (bind-mounted at `/mke4k-lab`); with a bare `docker run` it is the
   | MKE4k airgap | `t deploy lab airgap` |
   | MKE3 airgap | `t deploy lab mke3-airgap` |
   | Re-run only the install on existing instances | `t deploy cluster [mke3\|airgap\|mke3-airgap]` |
-  | Add-ons on a running cluster | `t deploy nfs [mke3]`, `t deploy msr4 [airgap]`, `t deploy kof [full\|lean] [airgap]`, `t deploy k0rdent-ui` |
+  | Add-ons on a running cluster | `t deploy nfs [mke3]`, `t deploy msr4 [airgap]`, `t deploy kof [full\|lean] [airgap]`, `t deploy k0rdent-ui`, `t deploy child-cluster` (online MKE4k) |
 
   Some add-ons also change AWS: online `t deploy kof` (Grafana gateway) and `t deploy k0rdent-ui`
   run `terraform apply` for an NLB listener + SG rule; `t destroy k0rdent-ui` does a targeted
@@ -87,7 +88,8 @@ Layout and flows are documented in `CLAUDE.md` → *Architecture*. Key conventio
 
 - **`bin/t-commandline.bash`** (single ~7k-line file, `set -euo pipefail`):
   - Entry points are `cmd_<verb>_<noun>[_<variant>]`, dispatched by the `case` block at the bottom.
-    A new command needs: the function, a dispatch arm, the usage/help text, and README + CLAUDE.md rows.
+    A new command needs: the function, a dispatch arm, the usage/help text, a `docs/commands.md` row
+    (README only for everyday commands) and the CLAUDE.md list.
   - Log only via `info` / `success` / `warn` / `error` / `die`. Fail loudly with `die "<actionable msg>"`.
   - Reuse helpers instead of re-implementing: `load_config`, `write_tfvars`, `tf_apply`, `tf_output`,
     `detect_deploy_mode`, `ssh_node`, `fetch_current_mke4_yaml`, `mkectl_apply_mode`, `version_gte`.
@@ -100,7 +102,7 @@ Layout and flows are documented in `CLAUDE.md` → *Architecture*. Key conventio
     mandatory), read `< /dev/tty … || true`, and fall back to a safe non-interactive default.
     An unguarded `read < /dev/tty` kills the whole command under `set -e` when there is no terminal.
 - **`config`**: new knobs go in the right section (basic / airgap / advanced) with a comment, a sane
-  default, and a row in the README *Configuration Reference* (and CLAUDE.md table if user-facing).
+  default, and a row in `docs/configuration.md` (and the CLAUDE.md table if user-facing).
   Thread them through `write_tfvars` + `terraform/variables.tf` if Terraform needs them.
 - **Terraform**: tag everything with `Cluster` (the reaper and `cleanup-aws.sh` find resources by
   it). Mode-specific resources are gated with `count` on `airgap_enabled` / `mke3_enabled` /
@@ -133,5 +135,5 @@ End-to-end verification means a real deploy, which needs the user's approval (ru
 
 - Commit subjects follow the existing style: `<area>: <imperative summary>` (e.g.
   `nfs: fail loudly on client-install errors`, `expiry: …`, `mke3: …`).
-- Keep `README.md` (user-facing), `CLAUDE.md` (architecture) and this file in sync with behavior
+- Keep `README.md` + `docs/` (user-facing; detail goes in `docs/`), `CLAUDE.md` (architecture) and this file in sync with behavior
   changes in the same commit.
