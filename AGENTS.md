@@ -51,10 +51,9 @@ several EC2 instances (nodes, plus NFS server / bastion when enabled), 1–2 NLB
 - **Interactive prompts — plan for them**, since agent shells usually have no TTY:
   - `cluster_name` left at `mke4k-lab`: first deploy asks for an owner name on a TTY; without one it
     silently picks a random suffix. Prefer setting `cluster_name` explicitly (≤ 20 chars, `a-z0-9-`).
-  - After `t deploy lab mke3`, `t deploy lab mke3-airgap` and `t deploy lab|cluster airgap`, an upgrade-prep `[y/N]` prompt
-    reads from `/dev/tty`. With no TTY this read fails and the command **exits non-zero after the
-    cluster is already installed** — check `t status` before treating it as a failed deploy, and never
-    "retry" a full lab deploy on that basis.
+  - After `t deploy lab mke3`, `t deploy lab mke3-airgap` and `t deploy lab|cluster airgap`, an
+    upgrade-prep `[y/N]` prompt runs. Without a TTY it is skipped (answer = No) and the deploy exits 0;
+    if the user wants the prep, they run the deploy step interactively.
   - `t config apply` / `t config edit` require a TTY to confirm and will refuse otherwise. Hand
     those to the user.
 - **Long-running**: a full deploy takes tens of minutes (airgap noticeably longer: bundle upload). Run it in the
@@ -80,8 +79,9 @@ Layout and flows are documented in `CLAUDE.md` → *Architecture*. Key conventio
     anything they need comes from the bastion (Harbor, bind9, Squid, scp'd packages).
   - The bastion has no `jq`; parse remote output with `sed`/`awk`. Pass untrusted strings to remote
     shells base64-encoded (see `_mke3_remote_login_snippet`).
-  - Interactive prompts must read `< /dev/tty` and be guarded with `[[ -t 0 ]]`, with a
-    non-interactive default.
+  - Interactive prompts must be guarded with `has_tty` (or `die` with a hint when a TTY is
+    mandatory), read `< /dev/tty … || true`, and fall back to a safe non-interactive default.
+    An unguarded `read < /dev/tty` kills the whole command under `set -e` when there is no terminal.
 - **`config`**: new knobs go in the right section (basic / airgap / advanced) with a comment, a sane
   default, and a row in the README *Configuration Reference* (and CLAUDE.md table if user-facing).
   Thread them through `write_tfvars` + `terraform/variables.tf` if Terraform needs them.

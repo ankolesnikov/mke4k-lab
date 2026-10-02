@@ -90,6 +90,8 @@ docker cp mke4k-lab:/mke4k-lab/terraform/terraform.tfstate .
 
 ### Configure and deploy from the container
 
+`t` runs only inside the container (it refuses to start without `MKE4K_LAB_CONTAINER=1`, which the Dockerfile and `run.sh` set); the host needs just `docker` (plus the `aws` CLI v2 if you use `bin/cleanup-aws.sh`). The image ships `terraform`, `kubectl`, `helm` v3 (helm v4 is not supported by KOF), `jq`, `yq` (mikefarah v4), `openssl` and `ssh`/`scp`; `mkectl` and `launchpad` are downloaded automatically at the versions set in `config`.
+
 Edit `config` in the host checkout or inside the container:
 
 ```bash
@@ -443,6 +445,7 @@ It runs automatically at the end of `t deploy lab` / `t deploy lab airgap` when 
 | `t expiry` | Show the current auto-expiry deadline |
 | `t expiry <days>` | Re-arm the deadline to `<days>` (≥1) days from **now** |
 | `t expiry off` | Disable auto-expiry (the lab will not self-delete) |
+| `t expiry status` | One-line local status (time left / passed / disabled / no lab); needs no AWS credentials and runs on every shell start |
 
 Every lab deletes itself `expiry_days` (default `3`) days after creation unless `t destroy lab` runs first. Terraform provisions a reaper entirely inside AWS — an EventBridge Scheduler one-shot that invokes a Lambda (`terraform/reaper.py`) — so it fires even if your container or laptop is off, and works in airgap too (the Lambda runs outside the lab VPC). The Lambda deletes every resource tagged with the lab's `Cluster` tag (EC2, NLBs + target groups, VPC and dependencies, CCM IAM, key pair), then removes its own schedule, roles and function.
 
@@ -450,7 +453,7 @@ Every lab deletes itself `expiry_days` (default `3`) days after creation unless 
 - `t expiry <days>|off` does a **targeted** `terraform apply` of the reaper resources only — the running cluster is never touched. The override is stored in `.expiry-days` / `.expiry-base` (project root) and takes precedence over `config`; `t destroy lab` clears it.
 - `expiry_days=0` in `config` disables the reaper from the start.
 - `expiry_dry_run=true` makes the Lambda log what it *would* delete (CloudWatch) without deleting anything. Invoke it on demand: `aws lambda invoke --function-name <cluster_name>-reaper /dev/stdout`.
-- The deadline is shown in the deploy summary and by `t expiry`.
+- The deadline is shown in the deploy summary, by `t expiry`, and by `t expiry status` (also printed when the container shell starts).
 
 ### Cluster configuration
 
@@ -661,7 +664,7 @@ t destroy lab
 
 | Variable | Default | Description |
 |---|---|---|
-| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, the first `t deploy lab\|instances` asks for your name (interactive terminal only) → `mke4k-lab-<name>` plus an `Owner` tag on every resource; non-interactive runs get a random 4-char suffix (e.g. `mke4k-lab-a3f2`). Persisted in `.cluster-id` / `.owner` |
+| `cluster_name` | `mke4k-lab` | Name prefix for all resources. Left as default, the first `t deploy lab\|instances` asks for your name (interactive terminal only; sanitised to a-z, 0-9, max 10 chars) → `mke4k-lab-<name>` plus an `Owner` tag on every resource; non-interactive runs (or an empty answer) get a random 4-char suffix (e.g. `mke4k-lab-a3f2`). Persisted in `.cluster-id` / `.owner`. Set an explicit name (≤ 20 chars) to skip the prompt |
 | `expiry_days` | `3` | Auto-delete the whole lab this many days after creation (`0` = never). See [Auto-expiry](#auto-expiry) |
 | `expiry_dry_run` | `false` | Reaper only logs what it would delete (CloudWatch) |
 | `controller_count` | `1` | Number of controller nodes (use 3 for HA) |
