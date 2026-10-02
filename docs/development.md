@@ -70,6 +70,7 @@ Offline regression tests (no AWS) live in `tests/`:
 bash tests/test_container_launcher.sh   # run.sh arguments, mounts, host guard (mock docker)
 bash tests/test_expiry_status.sh        # t expiry status with a mocked terraform; needs GNU date (Linux/container)
 bash tests/test_lab_local_state.sh      # no .cluster-id without a lab; t destroy lab removes only this lab's local files
+bash tests/test_child_teardown.sh       # t destroy lab never tears down while a child cluster may still exist
 ```
 
 [AGENTS.md](../AGENTS.md) holds the rules for AI agents working in this repo: which commands need user approval, secrets, non-TTY behaviour, and the validation to run before every push.
