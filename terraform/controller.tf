@@ -8,9 +8,11 @@ resource "aws_instance" "cluster-controller" {
   subnet_id              = var.airgap_enabled ? aws_subnet.airgap_private[0].id : aws_subnet.public.id
 
   # AWS CCM matches Nodes to instances by PrivateDnsName (the FQDN), but Ubuntu's
-  # cloud-init defaults to the SHORT hostname — force the FQDN form. Declarative so
-  # cloud-init fetches local-hostname itself (over IMDSv2) and re-applies it every
-  # boot. RHEL's cloud-init already prefers the FQDN; this is a no-op there.
+  # cloud-init defaults to the SHORT hostname — ask for the FQDN form. Caveat: on
+  # Ubuntu 22.04 (cloud-init 26.1) this does not take effect on first boot — the
+  # init-local stage sets the short name before user-data is read and the init stage
+  # then skips ("No hostname changes") — so ensure_node_hostnames (SSH, before every
+  # install) is what actually sets the FQDN there. RHEL already prefers the FQDN.
   # manage_etc_hosts must stay "localhost": "true" re-renders the whole file each
   # boot and would wipe the airgap registry entry added by setup_node_dns.
   user_data = <<-EOF
