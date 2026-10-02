@@ -87,3 +87,13 @@ All settings live in `config` (sourced by bash). Child-cluster settings are in [
 | `kof_reuse_mke_monitoring` | `true` | Reuse MKE4's built-in monitoring instead of duplicating it (drops KOF's node-exporter + kube-proxy/coredns/apiserver scrapes, KSM custom-resource-only, adds MKE's Prometheus as Grafana datasource) |
 | `kof_reuse_mke_kubelet` | `true` | Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted (~2x otherwise) |
 | `kof_sf_notifier_enabled` | `false` | Route alerts with severity critical\|warning\|error to the sf-notifier webhook. sf-notifier itself is deployed separately by hand — leave `false` unless it is running |
+| `kof_lean_prune_folders` | `Istio,Opencost,Victoria Traces` | Lean mode: Grafana dashboard folders to drop (comma-separated) |
+| `kof_lean_prune_dashboards` | `kps-nodes-aix,kps-nodes-darwin` | Lean mode: individual dashboards to drop (comma-separated) |
+
+## k0rdent UI settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI at the end of `t deploy lab` / `t deploy lab airgap`; also required for `t deploy k0rdent-ui`. **Touches terraform** (NLB listener + SG rule) |
+| `k0rdent_ui_nodeport` | `33003` | NodePort the Envoy gateway is pinned to (range 32768-35535; 33001/33002/33443 taken) |
+| `k0rdent_ui_lb_port` | `8445` | NLB listener port (online) / local port of `t tunnel k0rdent-ui` (airgap) |
