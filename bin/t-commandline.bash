@@ -797,9 +797,11 @@ RESOLVEOF
 # PrivateDnsName. A short hostname yields:
 #   failed to get instance metadata for node ip-a-b-c-d: instance not found
 #
-# terraform user_data already asks cloud-init for the FQDN
-# (prefer_fqdn_over_hostname), but that only runs at first boot and only on
-# instances created after that change — so verify/repair here before install.
+# terraform user_data asks cloud-init for the FQDN (prefer_fqdn_over_hostname),
+# but on Ubuntu 22.04 that does not take effect on first boot (cloud-init's
+# init-local stage sets the short name before user-data is read; the init stage
+# then skips), and it only ever runs at first boot — so this function is what
+# sets the FQDN on Ubuntu nodes. The name it sets survives reboots.
 # Runs for every OS. IMDS is link-local, so this works in airgap and needs no
 # DNS — hence it can run before setup_node_dns. It is called before
 # setup_rhel_node_prereqs so that the RHEL reboot there re-asserts the name.
@@ -895,7 +897,7 @@ ensure_node_hostnames() {
                 info "  hostname → ${node_ip} ($(awk '/HOSTNAME_OK/ {print $2}' <<<"${node_out}"))"
                 ;;
             *HOSTNAME_FIXED*)
-                warn "  hostname → ${node_ip} repaired to $(awk '/HOSTNAME_FIXED/ {print $2}' <<<"${node_out}")"
+                info "  hostname → ${node_ip} set to $(awk '/HOSTNAME_FIXED/ {print $2}' <<<"${node_out}")"
                 fixed=$((fixed + 1))
                 ;;
             *)
@@ -915,7 +917,7 @@ Set ccm_enabled=false in config to deploy without the cloud provider."
     done
 
     if [[ ${fixed} -gt 0 ]]; then
-        success "Node hostnames verified (${fixed} repaired)."
+        success "Node hostnames verified (FQDN set on ${fixed} node(s))."
     else
         success "Node hostnames verified."
     fi
