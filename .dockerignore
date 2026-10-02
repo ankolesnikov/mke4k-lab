@@ -2,6 +2,9 @@
 .owner
 .expiry-days
 .expiry-base
+.child-cluster
+terraform/child.kubeconfig
+terraform/child_credentials.txt
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform/
@@ -35,6 +38,7 @@ mke3/
 Dockerfile
 CLAUDE.md
 README.md
+docs/
 kof/MKE4-INTEGRATION.md
 kof/INSTALL-MKE.md
 kof/KOF-RUNBOOK.md
