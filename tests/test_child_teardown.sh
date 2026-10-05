@@ -61,6 +61,15 @@ fi
 [[ ! -e "${test_dir}/destroy-called" ]] || fail "terraform destroy ran despite the failed CRD lookup"
 [[ -f "${test_dir}/.child-cluster" ]] || fail ".child-cluster was dropped on a failed CRD lookup"
 
+# 1b. CRD lookup fails with no local record -> still refuse (the record can be
+#     missing, or the child was created outside t).
+MOCK_CRD=error MOCK_CD_LEFT=0; reset
+rm -f "${test_dir}/.child-cluster"
+if "${test_dir}/bin/t-commandline.bash" destroy lab >/dev/null 2>&1; then
+    fail "'t destroy lab' succeeded on a failed CRD lookup without a child record"
+fi
+[[ ! -e "${test_dir}/destroy-called" ]] || fail "terraform destroy ran despite the failed CRD lookup (no record)"
+
 # 2. Interrupted delete: MkeChildConfig gone, ClusterDeployment still there ->
 #    wait for it before terraform destroy.
 MOCK_CRD=present MOCK_CD_LEFT=2; reset

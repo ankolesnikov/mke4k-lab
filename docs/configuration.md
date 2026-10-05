@@ -14,8 +14,8 @@ All settings live in `config` (sourced by bash). Child-cluster settings are in [
 | `controller_flavor` | `m5a.xlarge` | EC2 instance type for controllers |
 | `worker_flavor` | `m5a.large` | EC2 instance type for workers |
 | `region` | `eu-central-1` | AWS region |
-| `expiry_days` | `3` | Auto-delete the whole lab this many days after creation (`0` = never). See [Auto-expiry](commands.md#auto-expiry) |
-| `expiry_dry_run` | `false` | Reaper only logs what it would delete (CloudWatch) |
+| `expiry_days` | `3` | Auto-delete the whole lab this many days after creation unless `t destroy lab` runs first (`0` = never). A reaper (EventBridge Scheduler → Lambda) runs inside AWS, so it fires even if the container is gone. Change it on a live lab with `t expiry <days>` / `t expiry off`. Does not cover child clusters |
+| `expiry_dry_run` | `false` | When `true`, the reaper only logs (CloudWatch) what it would delete instead of deleting it — for checking its scope. It takes effect at the next apply of the reaper (`t deploy lab\|instances`, or `t expiry <days>`), not by editing `config` alone. **With `false`, invoking the Lambda by hand deletes the lab**; check first with `aws lambda get-function-configuration --function-name <cluster_name>-reaper --query Environment.Variables.DRY_RUN`, then `aws lambda invoke --function-name <cluster_name>-reaper /dev/stdout` |
 | `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu) |
 | `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn) |
 | `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
