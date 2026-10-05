@@ -14,6 +14,8 @@ All settings live in `config` (sourced by bash). Child-cluster settings are in [
 | `controller_flavor` | `m5a.xlarge` | EC2 instance type for controllers |
 | `worker_flavor` | `m5a.large` | EC2 instance type for workers |
 | `region` | `eu-central-1` | AWS region |
+| `expiry_days` | `3` | Auto-delete the whole lab this many days after creation unless `t destroy lab` runs first (`0` = never). A reaper (EventBridge Scheduler → Lambda) runs inside AWS, so it fires even if the container is gone. Change it on a live lab with `t expiry <days>` / `t expiry off`. Does not cover child clusters |
+| `expiry_dry_run` | `false` | When `true`, the reaper only logs (CloudWatch) what it would delete instead of deleting it — for checking its scope. It takes effect at the next apply of the reaper (`t deploy lab\|instances`, or `t expiry <days>`), not by editing `config` alone. **With `false`, invoking the Lambda by hand deletes the lab**; check first with `aws lambda get-function-configuration --function-name <cluster_name>-reaper --query Environment.Variables.DRY_RUN`, then `aws lambda invoke --function-name <cluster_name>-reaper /dev/stdout` |
 | `os_name` | `ubuntu` | Cluster node OS: `ubuntu` or `redhat` (bastion/NFS server always Ubuntu) |
 | `os_version` | `22.04` | Node OS version — MKE4-supported: ubuntu `22.04`/`24.04`, redhat `9.6`/`8.10` (others warn) |
 | `ccm_enabled` | `false` | Creates IAM role; required for LoadBalancer services. Auto-disabled in airgap |
@@ -85,3 +87,13 @@ All settings live in `config` (sourced by bash). Child-cluster settings are in [
 | `kof_reuse_mke_monitoring` | `true` | Reuse MKE4's built-in monitoring instead of duplicating it (drops KOF's node-exporter + kube-proxy/coredns/apiserver scrapes, KSM custom-resource-only, adds MKE's Prometheus as Grafana datasource) |
 | `kof_reuse_mke_kubelet` | `true` | Sub-option of reuse: also drop KOF's duplicate kubelet/cAdvisor scrape so pod CPU/memory aren't double-counted (~2x otherwise) |
 | `kof_sf_notifier_enabled` | `false` | Route alerts with severity critical\|warning\|error to the sf-notifier webhook. sf-notifier itself is deployed separately by hand — leave `false` unless it is running |
+| `kof_lean_prune_folders` | `Istio,Opencost,Victoria Traces` | Lean mode: Grafana dashboard folders to drop (comma-separated) |
+| `kof_lean_prune_dashboards` | `kps-nodes-aix,kps-nodes-darwin` | Lean mode: individual dashboards to drop (comma-separated) |
+
+## k0rdent UI settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `k0rdent_ui_enabled` | `false` | Publish the k0rdent UI at the end of `t deploy lab` / `t deploy lab airgap`; also required for `t deploy k0rdent-ui`. **Touches terraform** (NLB listener + SG rule) |
+| `k0rdent_ui_nodeport` | `33003` | NodePort the Envoy gateway is pinned to (range 32768-35535; 33001/33002/33443 taken) |
+| `k0rdent_ui_lb_port` | `8445` | NLB listener port (online) / local port of `t tunnel k0rdent-ui` (airgap) |

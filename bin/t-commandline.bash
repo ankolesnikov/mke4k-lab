@@ -31,6 +31,11 @@ die()     { error "$*"; exit 1; }
 # version_gte <a> <b> — returns 0 (true) if version a >= b
 version_gte() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
 
+# has_tty — true when stdin is a terminal and /dev/tty can be opened. Guard every
+# interactive prompt with it so CI / agents / `docker run` without -t fall back to
+# the non-interactive default instead of dying under `set -e`.
+has_tty() { [[ -t 0 ]] && { : < /dev/tty; } 2>/dev/null; }
+
 # Sanitize a user-typed name for use in AWS resource names: lowercase
 # a-z/0-9/hyphen only, max 10 chars. AWS caps NLB/target-group names at 32
 # chars and the longest generated name is <cluster_name>-mke3-nlb-sg (+12),
@@ -408,7 +413,7 @@ ensure_mkectl() {
     # Already at the right version?
     if command -v mkectl &>/dev/null; then
         local got
-        got="$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+        got="$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1 || true)"
         if [[ "${got}" == "${want}" ]]; then
             return 0
         fi
@@ -782,9 +787,11 @@ RESOLVEOF
 # PrivateDnsName. A short hostname yields:
 #   failed to get instance metadata for node ip-a-b-c-d: instance not found
 #
-# terraform user_data already asks cloud-init for the FQDN
-# (prefer_fqdn_over_hostname), but that only runs at first boot and only on
-# instances created after that change — so verify/repair here before install.
+# terraform user_data asks cloud-init for the FQDN (prefer_fqdn_over_hostname),
+# but on Ubuntu 22.04 that does not take effect on first boot (cloud-init's
+# init-local stage sets the short name before user-data is read; the init stage
+# then skips), and it only ever runs at first boot — so this function is what
+# sets the FQDN on Ubuntu nodes. The name it sets survives reboots.
 # Runs for every OS. IMDS is link-local, so this works in airgap and needs no
 # DNS — hence it can run before setup_node_dns. It is called before
 # setup_rhel_node_prereqs so that the RHEL reboot there re-asserts the name.
@@ -880,7 +887,7 @@ ensure_node_hostnames() {
                 info "  hostname → ${node_ip} ($(awk '/HOSTNAME_OK/ {print $2}' <<<"${node_out}"))"
                 ;;
             *HOSTNAME_FIXED*)
-                warn "  hostname → ${node_ip} repaired to $(awk '/HOSTNAME_FIXED/ {print $2}' <<<"${node_out}")"
+                info "  hostname → ${node_ip} set to $(awk '/HOSTNAME_FIXED/ {print $2}' <<<"${node_out}")"
                 fixed=$((fixed + 1))
                 ;;
             *)
@@ -900,7 +907,7 @@ Set ccm_enabled=false in config to deploy without the cloud provider."
     done
 
     if [[ ${fixed} -gt 0 ]]; then
-        success "Node hostnames verified (${fixed} repaired)."
+        success "Node hostnames verified (FQDN set on ${fixed} node(s))."
     else
         success "Node hostnames verified."
     fi
@@ -1665,7 +1672,7 @@ ensure_mkectl_on_bastion() {
     ssh_node "${ssh_key}" "${bastion_ip}" "
         need_install=true
         if command -v mkectl &>/dev/null; then
-            got=\$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            got=\$(mkectl version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1 || true)
             if [[ \"\${got}\" == '${want}' ]]; then
                 echo 'mkectl ${want} already installed'
                 need_install=false
@@ -2739,12 +2746,16 @@ generate_nodes_yaml() {
 # ---------------------------------------------------------------------------
 prompt_mkectl_for_upgrade() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Download mkectl now to prepare for MKE3 → MKE4k upgrade?${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             # Temporarily set mke4k_version so ensure_mkectl uses the chosen value
             local saved="${mke4k_version}"
@@ -2764,12 +2775,16 @@ prompt_mkectl_for_upgrade() {
 # ---------------------------------------------------------------------------
 prompt_upgrade_prep_airgap() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Prepare for MKE3 → MKE4k upgrade? (upload bundle + generate config)${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
@@ -2846,12 +2861,16 @@ prompt_upgrade_prep_airgap() {
 # ---------------------------------------------------------------------------
 prompt_mke4k_upgrade_prep_airgap() {
     echo ""
-    local answer
-    read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer < /dev/tty
+    local answer=""
+    if has_tty; then
+        read -r -p "$(echo -e "  ${BOLD}Prepare for MKE4k → MKE4k airgap upgrade? (upload bundle + release-matrix)${RESET} [y/N] ")" answer < /dev/tty || true
+    else
+        info "No interactive terminal — skipping the upgrade-prep prompt."
+    fi
     case "${answer}" in
         [yY]|[yY][eE][sS])
             local ver_input
-            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input < /dev/tty
+            read -r -p "  Target MKE4k version [${mke4k_version}]: " ver_input < /dev/tty || true
             local target="${ver_input:-${mke4k_version}}"
             local saved="${mke4k_version}"
             mke4k_version="${target}"
@@ -4614,6 +4633,29 @@ kof_helm_install() {
     return 0
 }
 
+# KOF needs real capacity: live tests left pods Pending (VMCluster failed) on
+# 1x m5a.large and still 4 collector pods Pending on 3x m5a.large; 3x m5a.xlarge
+# ran clean. Warn (don't block) when config is below that. vCPU/memory come from
+# EC2 DescribeInstanceTypes (c5.xlarge is 4 vCPU but only 8 GiB); without AWS
+# access, fall back to the size suffix (*.large and smaller = too small).
+kof_warn_capacity() {
+    local small=false spec vcpu mib
+    spec="$(aws ec2 describe-instance-types --region "${region}" --instance-types "${worker_flavor}" \
+        --query 'InstanceTypes[0].[VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]' --output text 2>/dev/null || true)"
+    read -r vcpu mib <<<"${spec}" || true
+    if [[ "${vcpu}" =~ ^[0-9]+$ && "${mib}" =~ ^[0-9]+$ ]]; then
+        (( vcpu < 4 || mib < 15360 )) && small=true
+    elif [[ "${worker_flavor}" =~ \.(nano|micro|small|medium|large)$ ]]; then
+        small=true
+    else
+        warn "Could not look up ${worker_flavor} (EC2 DescribeInstanceTypes) — KOF needs >= 4 vCPU / 16 GB per worker; check it yourself."
+    fi
+    if (( worker_count < 3 )) || [[ "${small}" == "true" ]]; then
+        warn "KOF needs about 3 workers with >= 4 vCPU / 16 GB (e.g. worker_count=3, worker_flavor=m5a.xlarge)."
+        warn "  This lab has worker_count=${worker_count}, worker_flavor=${worker_flavor}: some KOF pods may stay Pending."
+    fi
+}
+
 cmd_deploy_kof() {
     local mode_arg="${1:-}" airgap_arg="${2:-}"
     load_config
@@ -4626,6 +4668,7 @@ cmd_deploy_kof() {
         full|lean) kof_mode="${mode}" ;;
         *) die "Unknown KOF mode '${mode}'. Try: full, lean." ;;
     esac
+    kof_warn_capacity
 
     # Resolve online vs airgap: the airgap topology is a property of the deployed
     # lab (bastion present), so auto-detect from terraform output — the explicit
