@@ -4765,6 +4765,8 @@ kof_warn_capacity() {
         (( vcpu < 4 || mib < 15360 )) && small=true
     elif [[ "${worker_flavor}" =~ \.(nano|micro|small|medium|large)$ ]]; then
         small=true
+    else
+        warn "Could not look up ${worker_flavor} (EC2 DescribeInstanceTypes) — KOF needs >= 4 vCPU / 16 GB per worker; check it yourself."
     fi
     if (( worker_count < 3 )) || [[ "${small}" == "true" ]]; then
         warn "KOF needs about 3 workers with >= 4 vCPU / 16 GB (e.g. worker_count=3, worker_flavor=m5a.xlarge)."
@@ -5709,7 +5711,7 @@ _child_lab_supported() {
 }
 
 # AWS credentials for the CAPA identity: CHILD_AWS_* override the container's.
-# Without static AWS_* keys (run.sh with an SSO profile never forwards them),
+# Without static AWS_* keys (e.g. AWS_PROFILE with an SSO profile in a mounted ~/.aws),
 # fall back to the active profile's resolved credentials; SSO yields temporary
 # ones, which child_preflight warns about.
 _child_aws_creds() {
@@ -5762,7 +5764,7 @@ child_preflight() {
 
     _child_aws_creds
     [[ -n "${_child_key}" && -n "${_child_secret}" ]] \
-        || die "AWS credentials not set. Use an AWS profile (run.sh --aws-profile NAME; SSO login still valid) or export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or CHILD_AWS_ACCESS_KEY_ID/CHILD_AWS_SECRET_ACCESS_KEY)."
+        || die "AWS credentials not set. Use an AWS profile (AWS_PROFILE + ~/.aws; SSO login still valid) or export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or CHILD_AWS_ACCESS_KEY_ID/CHILD_AWS_SECRET_ACCESS_KEY)."
     if [[ -n "${_child_token}" ]]; then
         warn "Temporary AWS credentials (session token) detected. CAPA keeps using them for the child's"
         warn "lifetime: once they expire, export fresh ones and run 't rotate child-creds' (the destroy"
@@ -6301,11 +6303,10 @@ child_destroy_before_teardown() {
     if [[ -f "${KUBECONFIG}" ]] && kubectl get nodes --request-timeout=20s >/dev/null 2>&1; then
         local rc=0 cand left
         _child_crd_state || rc=$?
-        if (( rc == 2 )); then
-            [[ -f "${marker}" ]] && die "Could not query CRD ${CHILD_CRD} (API error) while child $(cat "${marker}") is recorded. Re-run, or set T_SKIP_CHILD=1 to skip (its AWS resources would be orphaned)."
-            warn "Could not query CRD ${CHILD_CRD}; no child cluster is recorded locally — continuing."
-            return 0
-        fi
+        # An API error can't prove there is no child (the local record may be
+        # missing, or a child created outside t) — fail closed either way.
+        (( rc == 2 )) && die "Could not query CRD ${CHILD_CRD} (API error), so child clusters can't be ruled out. Re-run, or set T_SKIP_CHILD=1 to skip (any child's AWS resources would be orphaned)."
+
         if (( rc == 1 )); then
             rm -f "${marker}"
             return 0
