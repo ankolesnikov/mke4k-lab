@@ -90,6 +90,14 @@ This will:
 2. Generate `terraform/mke4.yaml` from the provisioned infrastructure
 3. Run `mkectl apply -f terraform/mke4.yaml`
 
+## Tests
+
+Offline regression tests (no AWS; `terraform`/`kubectl` are stubbed) live in `tests/`. Run them in the container or on Linux with `jq`:
+
+```bash
+bash tests/test_child_teardown.sh   # t destroy lab never tears down while a child cluster may still exist
+```
+
 ## Project Structure
 
 ```
@@ -100,6 +108,7 @@ mke4k-lab/
 │   ├── t-commandline.bash        # CLI implementation
 │   └── cleanup-aws.sh            # Emergency AWS cleanup (when state is lost)
 ├── child-cluster/                # MKE4k child cluster templates (AWS identity, MkeChildConfig)
+├── tests/                        # Offline regression tests
 └── terraform/
     ├── vpc.tf                    # Dedicated VPC, IGW, public subnet, route table
     ├── main.tf                   # Provider, SG, keypair, AMI lookup
